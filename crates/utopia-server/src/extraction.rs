@@ -1726,7 +1726,11 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
                     }
                 };
                 let datatype = attr.datatype.as_deref().unwrap_or("text");
-                let Some(normalized) = utopia_extract::normalize_attr_value(datatype, &raw) else {
+                // 只相对一件事给出的日期（「触发日后 45 天」，#681 §4）照原文收下、带着标记：
+                // 它是新的状态值，时态引擎照常用它接替前一个截止日
+                let Some(mut object_value) =
+                    utopia_extract::attr_object_value(datatype, &raw, f.relative)
+                else {
                     tracing::debug!(%document_id, attr = attr.key, ?raw, "属性值不合 datatype，跳过");
                     drop_signal(
                         state,
@@ -1739,7 +1743,6 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
                     .await;
                     continue;
                 };
-                let mut object_value = serde_json::json!({ "value": normalized });
                 // 单位随事实落笔：类型上的单位以后改了，旧值仍按记录时的单位读。
                 // 记哪个单位照 `unit_for`——从前这里无条件盖上声明的单位，实测
                 //「提供 500 兆瓦的风电」被模型记成金额，再盖上 ¥ 就成了 500 块钱
@@ -1791,11 +1794,11 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
                     Some(f.predicate.as_str()),
                 )
                 .await?;
-                if !created {
-                    continue;
+                if created {
+                    fact_count += 1;
                 }
-                fact_count += 1;
-                // 单值属性 = functional：新值闭合旧值（属性历史由此而来）
+                // 单值属性 = functional：新值闭合旧值（属性历史由此而来）。并进已有断言的也对：
+                // 这份证据的日期可能更早，时间线的形状跟着变（#679）
                 if attr.functional && attr.temporal == "state" {
                     let report = utopia_store::temporal::reconcile_new_fact(
                         &state.pool,
@@ -2757,12 +2760,12 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
                     Some(f.predicate.as_str()),
                 )
                 .await?;
-                if !created {
-                    continue;
+                if created {
+                    fact_count += 1;
                 }
-                fact_count += 1;
                 // 时态对账：带唯一性约束的状态关系落新事实即检测矛盾（纯规则点查，
-                // 自动闭合走"作废+改写"，拿不准进 fact_conflicts 人裁）
+                // 自动闭合走"作废+改写"，拿不准进 fact_conflicts 人裁）。并进已有断言的
+                // 也对：多了一份证据，时间线的形状可能跟着变（#679）
                 // 没有谓词就没有关系元数据，也就不参与时态对账——
                 // 一条说不出是什么关系的边，本来就不可能带唯一性约束
                 if let Some((pid, (func, inv_func, temporal))) =
