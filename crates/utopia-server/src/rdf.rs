@@ -378,6 +378,12 @@ pub fn emit_relation(
             sink.r(&iri, &nn(rdf::TYPE.as_str()), &owl(term))?;
         }
     }
+    // 时间语义也照抄（0031）：一个 event 谓词的事实两端是同一刻，一个 eternal 谓词的
+    // 事实没有日期——读的人不看这一条，会把前者读成一天的状态、后者读成从不知何时起。
+    // 状态是默认，不写
+    if r.temporal != "state" {
+        sink.l(&iri, &utopia("temporal"), &text(r.temporal.clone()))?;
+    }
     for d in &r.domains {
         if let Some(c) = vocab.class(*d) {
             let c = c.clone();
@@ -466,6 +472,10 @@ pub fn emit_fact(
     if let Some(o) = &object {
         sink.triple(TripleRef::new(stmt.as_ref(), rdf::OBJECT, o.as_ref()))?;
     }
+    // 只相对一件事给出的值（「触发日后 45 天」，#681 §4）：字面量是原文，这一行说它不是日期
+    if f.object_value.as_ref().is_some_and(is_relative) {
+        sink.l(&stmt, &utopia("relativeValue"), &flag(true))?;
+    }
     emit_validity(
         sink,
         &stmt,
@@ -489,6 +499,18 @@ pub fn emit_fact(
     }
     for quote in &f.quotes {
         sink.l(&stmt, &utopia("quote"), &text(quote.clone()))?;
+    }
+    // 边上的属性（0037）：陈述节点上各多一行，谓词是属性的 IRI，字面量按它的 datatype
+    for q in &f.qualifiers {
+        let Some(p) = vocab.relation(q.qualifier_type_id) else {
+            continue;
+        };
+        if let Some(v) = &q.value {
+            let (datatype, _) = vocab.literal_shape(q.qualifier_type_id);
+            sink.l(&stmt, p, &literal_value(v, datatype))?;
+        } else if let Some(e) = q.entity_id {
+            sink.r(&stmt, p, &names.entity(e))?;
+        }
     }
 
     // 现行三元组：**仍被持有，且现在仍成立**。区间已闭合或已撤回的不写这一条,
@@ -572,6 +594,10 @@ pub fn emit_derived(
         let p = names.fact(*premise);
         sink.r(&stmt, &prov("used"), &p)?;
     }
+    for premise in &d.premises_derived {
+        let p = names.derived(*premise);
+        sink.r(&stmt, &prov("used"), &p)?;
+    }
     Ok(())
 }
 
@@ -604,7 +630,13 @@ fn emit_validity(
     Ok(())
 }
 
-/// 属性事实的字面值。`{"value": …, "unit": …}` 或 `{"summary": …}`
+/// 值上带着 `"relative": true`：原文只相对一件事给出它，没有日历上的日期
+fn is_relative(v: &serde_json::Value) -> bool {
+    v.get("relative").and_then(|r| r.as_bool()) == Some(true)
+}
+
+/// 属性事实的字面值。`{"value": …, "unit": …}` 或 `{"summary": …}`。
+/// 相对的值写成普通字符串：`"45 days after the Trigger Date"^^xsd:date` 是个不合法的字面量
 fn literal_value(v: &serde_json::Value, datatype: Option<&str>) -> Literal {
     let raw = v.get("value").unwrap_or(v);
     let as_text = match raw {
@@ -617,6 +649,7 @@ fn literal_value(v: &serde_json::Value, datatype: Option<&str>) -> Literal {
         other => other.to_string(),
     };
     let ty: NamedNodeRef<'_> = match datatype {
+        _ if is_relative(v) => xsd::STRING,
         Some("number") => xsd::DECIMAL,
         Some("date") => xsd::DATE,
         Some("bool") => xsd::BOOLEAN,
@@ -678,6 +711,7 @@ mod tests {
 
     fn fact(n: u8) -> ExportFact {
         ExportFact {
+            qualifiers: Vec::new(),
             id: id(n),
             subject_id: id(10),
             predicate_id: Some(id(2)),
@@ -928,6 +962,36 @@ mod tests {
         );
     }
 
+    /// 日期属性上相对的值（#681 §4）导出成普通字符串，陈述上另有一行说它是相对的——
+    /// 写成 xsd:date 的字面量不合法，严格的解析器会整份拒收
+    #[test]
+    fn a_relative_deadline_is_a_string_that_says_it_is_relative() {
+        let dated = literal_value(&serde_json::json!({ "value": "2020-06-23" }), Some("date"));
+        assert_eq!(dated.datatype(), xsd::DATE);
+        let relative = literal_value(
+            &serde_json::json!({ "value": "45 days after the Trigger Date", "relative": true }),
+            Some("date"),
+        );
+        assert_eq!(relative.datatype(), xsd::STRING);
+        assert_eq!(relative.value(), "45 days after the Trigger Date");
+
+        let mut attr = fact(5);
+        attr.predicate_id = Some(id(4));
+        attr.object_id = None;
+        attr.object_value = Some(
+            serde_json::json!({ "value": "45 days after the Trigger Date", "relative": true }),
+        );
+        let quads = export(Format::Turtle, |sink, names, vocab| {
+            emit_fact(sink, names, vocab, &attr, at("2026-06-01T00:00:00Z")).unwrap();
+        });
+        assert!(has(
+            &quads,
+            STMT,
+            "urn:utopia:ns:relativeValue",
+            "\"true\"^^<http://www.w3.org/2001/XMLSchema#boolean>"
+        ));
+    }
+
     /// 业务规则的结论也要出现在导出里，而且宾语是**字面值**。
     ///
     /// 这一条挡的是一次静默丢失：取数那边原本 `JOIN rules`，而业务规则的
@@ -954,6 +1018,7 @@ mod tests {
             rule: "business".into(),
             rule_name: Some("Gas-bearing well".into()),
             premises: vec![id(5)],
+            premises_derived: Vec::new(),
         };
         let quads = export(Format::Turtle, |sink, names, vocab| {
             emit_derived(sink, names, vocab, &derived).unwrap();
@@ -1017,25 +1082,31 @@ mod tests {
             rule: "transitive".into(),
             rule_name: None,
             premises: vec![id(5)],
+            premises_derived: vec![id(6)],
         };
-        let quads = export(Format::Turtle, |sink, names, vocab| {
-            emit_derived(sink, names, vocab, &derived).unwrap();
-        });
-        let stmt = "<urn:utopia:kb:01a06dc4-f40a-7013-b09f-1b499e2e7441:derived:07070707-0707-0707-0707-070707070707>";
-        assert!(has(
-            &quads,
-            stmt,
-            "urn:utopia:ns:derived",
-            "\"true\"^^<http://www.w3.org/2001/XMLSchema#boolean>"
-        ));
-        assert_eq!(
-            objects(&quads, stmt, "http://www.w3.org/ns/prov#used"),
-            vec![STMT]
-        );
-        assert!(
-            !has(&quads, SUBJ, WORKS_FOR, OBJ),
-            "推出来的边不写成平铺三元组：那会让人把引擎的结论当成文档里的话"
-        );
+        for format in [Format::Turtle, Format::JsonLd] {
+            let quads = export(format, |sink, names, vocab| {
+                emit_derived(sink, names, vocab, &derived).unwrap();
+            });
+            let stmt = "<urn:utopia:kb:01a06dc4-f40a-7013-b09f-1b499e2e7441:derived:07070707-0707-0707-0707-070707070707>";
+            assert!(has(
+                &quads,
+                stmt,
+                "urn:utopia:ns:derived",
+                "\"true\"^^<http://www.w3.org/2001/XMLSchema#boolean>"
+            ));
+            assert_eq!(
+                objects(&quads, stmt, "http://www.w3.org/ns/prov#used"),
+                vec![
+                    STMT.to_string(),
+                    Names::new(kb(), None).unwrap().derived(id(6)).to_string()
+                ]
+            );
+            assert!(
+                !has(&quads, SUBJ, WORKS_FOR, OBJ),
+                "推出来的边不写成平铺三元组：那会让人把引擎的结论当成文档里的话"
+            );
+        }
     }
 
     #[test]

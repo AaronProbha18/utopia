@@ -25,6 +25,7 @@ use utopia_core::AppError;
 use utopia_extract::governor::{self, Step};
 use utopia_llm::{tool_result_message, LlmClient};
 use utopia_store::alerts;
+use utopia_store::execution_gate;
 use utopia_store::governance::{self as gov, Gate, NewDecision, Precedents, AUTO_CONF};
 use uuid::Uuid;
 
@@ -47,21 +48,22 @@ struct Ctx<'a> {
     settings: &'a Option<LlmSettings>,
 }
 
-/// 对一对的一次看法：第一层给的，或第二层看完改过的
-struct Look {
-    same: Option<bool>,
-    conf: f32,
-    why: Option<String>,
+/// 对一对的一次看法：第一层给的，或第二层看完改过的。裁决器（治理关着时）也用它：
+/// 判不定的对走同一个第二层（0028）
+pub(crate) struct Look {
+    pub(crate) same: Option<bool>,
+    pub(crate) conf: f32,
+    pub(crate) why: Option<String>,
     /// defer 留下的问题
-    question: Option<String>,
+    pub(crate) question: Option<String>,
     /// 第二层看了什么
-    trace: Vec<Value>,
+    pub(crate) trace: Vec<Value>,
     /// 第二层花的模型调用
-    calls: i32,
+    pub(crate) calls: i32,
 }
 
 impl Look {
-    fn from_batch(same: Option<bool>, conf: f32, why: Option<String>) -> Self {
+    pub(crate) fn from_batch(same: Option<bool>, conf: f32, why: Option<String>) -> Self {
         Look {
             same,
             conf,
@@ -368,7 +370,10 @@ fn pair_of(item: &ReviewItem, p: &Precedents) -> utopia_extract::AdjudicationPai
 }
 
 /// 第一层没定（没判决、置信度不到线），或者同名、大类不冲突、模型却说不同——那是它
-/// 最爱错的一种：都让第二层带着全部事实与原文再看一遍。硬规则拦下的不进：再看也不会改规则
+/// 最爱错的一种：都让第二层带着全部事实与原文再看一遍。名字的形状让人起疑的合并（版本
+/// 尾巴、含着名字的一长串）也再看：名字只能让人起疑，定不了是不是一个东西——「Lease
+/// Agreement dated May 16, 2016, as amended」与「Lease Agreement」形状上是一句话，事实上
+/// 是同一份租约。类型冲突这条硬规则拦下的不进：再看也不会改规则
 fn wants_second_look(item: &ReviewItem, p: &Precedents, look: &Look) -> bool {
     let types_conflict = gov::types_conflict(
         item.left.type_label.as_deref(),
@@ -379,10 +384,57 @@ fn wants_second_look(item: &ReviewItem, p: &Precedents, look: &Look) -> bool {
         && !types_conflict
         && look.same == Some(false)
         && look.calls == 0;
+    let doubted_merge =
+        name_doubts(shape) && !types_conflict && look.same == Some(true) && look.calls == 0;
     ((gov::gate(look.same, look.conf, types_conflict, shape, p) == Gate::Propose
         && look.uncertain())
-        || doubted_split)
+        || doubted_split
+        || doubted_merge)
         && p.reverts.is_empty()
+}
+
+/// 名字形状让人起疑的合并：版本尾巴，或含着另一个名字的一长串
+fn name_doubts(shape: gov::NameShape) -> bool {
+    matches!(shape, gov::NameShape::Version | gov::NameShape::Phrase)
+}
+
+/// 闸门看的名字形状。第二层带着两边的事实与原文看过、仍说是同一个的，形状的疑点已经由
+/// 证据答过了，不再按形状拦——拦的只剩没看过证据的第一层
+fn shape_for_gate(item: &ReviewItem, look: &Look) -> gov::NameShape {
+    settled_shape(
+        gov::name_shape(&item.left.name, &item.right.name),
+        look.calls > 0,
+    )
+}
+
+/// 形状的疑点在第二层读过证据之后就答完了
+fn settled_shape(shape: gov::NameShape, evidence_read: bool) -> gov::NameShape {
+    if evidence_read && name_doubts(shape) {
+        gov::NameShape::Unrelated
+    } else {
+        shape
+    }
+}
+
+/// 裁决器的入口（0028）：治理关着，攒批判不定的对也带工具再看一遍——同一个循环、
+/// 同一份预算。每次调用一个 run_id：一次裁决任务就是一次 run
+pub(crate) async fn look_again(
+    state: &AppState,
+    kb_id: Uuid,
+    client: &LlmClient,
+    settings: &Option<LlmSettings>,
+    item: &ReviewItem,
+    pair: &utopia_extract::AdjudicationPair,
+    earlier: &Look,
+) -> Option<Look> {
+    let ctx = Ctx {
+        state,
+        kb_id,
+        run_id: Uuid::now_v7(),
+        client,
+        settings,
+    };
+    second_look(&ctx, item, pair, earlier).await
 }
 
 /// 第二层看一对：预算够就看，看完的看法替掉第一层的；看不成（预算用完、模型出错）回 None，
@@ -423,7 +475,7 @@ async fn apply(ctx: &Ctx<'_>, item: &ReviewItem, p: &Precedents, look: Look) -> 
         item.left.type_label.as_deref(),
         item.right.type_label.as_deref(),
     );
-    let shape = gov::name_shape(&item.left.name, &item.right.name);
+    let shape = shape_for_gate(item, &look);
 
     let action = look.action();
     let precedents = gov::precedents_json(p);
@@ -456,6 +508,31 @@ async fn apply(ctx: &Ctx<'_>, item: &ReviewItem, p: &Precedents, look: Look) -> 
                     .await?;
                 let id = gov::record(pool, kb_id, decision("applied", None)).await?;
                 audit(ctx, "review.merge", item, conf, id).await;
+                return Ok(());
+            }
+            // 执行闸门（0027）：合并会立刻送出图外的东西——违规、派生、答案——留给人，
+            // 把握再高也不动手。agent 的看法照记成建议，理由前面写明是闸门留下的
+            let impact = execution_gate::impact_of(pool, kb_id, l, r).await?;
+            if let Some(hold) = execution_gate::hold(&impact) {
+                utopia_store::resolution::escalate_review(
+                    pool,
+                    item.id,
+                    &format!("escalate_impact|{hold}"),
+                )
+                .await?;
+                let held = match look.why.as_deref() {
+                    Some(why) => format!("held for a person: {}; {why}", hold.explain()),
+                    None => format!("held for a person: {}", hold.explain()),
+                };
+                gov::record(
+                    pool,
+                    kb_id,
+                    NewDecision {
+                        reason: Some(&held),
+                        ..decision("proposed", None)
+                    },
+                )
+                .await?;
                 return Ok(());
             }
             let (target, source) = utopia_store::resolution::merge_direction(pool, l, r).await?;
@@ -667,8 +744,14 @@ async fn lookup(
                             "review.keep" => "kept apart",
                             _ => "merged",
                         };
+                        // 人写的理由跟在后面：第二层去查台账，查到的该是「凭什么」
+                        let because = x
+                            .why
+                            .as_deref()
+                            .map(|w| format!("; they wrote: \"{w}\""))
+                            .unwrap_or_default();
                         format!(
-                            "\"{}\" ≟ \"{}\": {verb} by a person on {}",
+                            "\"{}\" ≟ \"{}\": {verb} by a person on {}{because}",
                             x.left,
                             x.right,
                             x.at.format("%Y-%m-%d")
@@ -678,6 +761,24 @@ async fn lookup(
                     .join("\n")
             };
             (out, format!("{n} decisions about \"{q}\""))
+        }
+        // 合并会牵动什么（0028）：模型先看到闸门（0027）会看到的东西，再决定是裁还是问
+        "consequences" => {
+            let impact =
+                execution_gate::impact_of(pool, kb_id, item.left.id, item.right.id).await?;
+            let families = if gov::types_conflict(
+                item.left.type_label.as_deref(),
+                item.right.type_label.as_deref(),
+            ) {
+                "\n- the two types belong to different families; the rules never merge across families"
+            } else {
+                ""
+            };
+            let out = format!("{}{families}", impact.describe());
+            let held = execution_gate::hold(&impact)
+                .map(|h| h.to_string())
+                .unwrap_or_else(|| "nothing held".into());
+            (out, format!("what a merge would touch: {held}"))
         }
         "namesakes" => {
             let q = args["query"].as_str().unwrap_or("");
@@ -834,5 +935,30 @@ pub async fn after_human_decision(
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_doubtful_shape_stops_counting_once_the_evidence_was_read() {
+        let lease = gov::name_shape(
+            "Lease Agreement dated May 16, 2016, as amended",
+            "Lease Agreement",
+        );
+        assert!(name_doubts(lease), "{lease:?}");
+        assert_eq!(settled_shape(lease, false), lease);
+        assert_eq!(settled_shape(lease, true), gov::NameShape::Unrelated);
+
+        let version = gov::name_shape("Claude Mythos 5", "Claude Mythos");
+        assert!(name_doubts(version), "{version:?}");
+        assert_eq!(settled_shape(version, false), version);
+
+        // 形状本来就不起疑的，读没读过证据都照旧
+        let same = gov::name_shape("OpenAI", "OpenAI");
+        assert!(!name_doubts(same));
+        assert_eq!(settled_shape(same, true), same);
     }
 }

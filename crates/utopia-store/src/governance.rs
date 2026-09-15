@@ -34,6 +34,9 @@ pub struct Precedent {
     pub left: String,
     pub right: String,
     pub at: DateTime<Utc>,
+    /// 人拍板时写的那一句（0026）。**先例带着理由才是先例**：只有结果的话，
+    /// 一次错误的合并会被读成"这类该合"，错误洗成政策。老行没有这一列，为空
+    pub why: Option<String>,
 }
 
 impl Precedent {
@@ -68,7 +71,8 @@ const R: &str = "lower(COALESCE(detail->>'right', detail->>'target', ''))";
 const COLS: &str = "id AS event_id, action,
          COALESCE(detail->>'left', detail->>'source', '') AS \"left\",
          COALESCE(detail->>'right', detail->>'target', '') AS \"right\",
-         created_at AS at";
+         created_at AS at,
+         NULLIF(detail->>'why', '') AS why";
 
 pub async fn precedents_for(
     pool: &PgPool,
@@ -184,21 +188,30 @@ async fn type_pair_stats(
 pub fn render_lines(p: &Precedents) -> Vec<String> {
     let verb = |x: &Precedent| if x.merged() { "merged" } else { "kept apart" };
     let day = |t: &DateTime<Utc>| t.format("%Y-%m-%d").to_string();
+    // 人写了理由就带上：模型该学的是「凭什么」，不是「多半怎么判」
+    let because = |x: &Precedent| {
+        x.why
+            .as_deref()
+            .map(|w| format!("; they wrote: \"{w}\""))
+            .unwrap_or_default()
+    };
     let mut out = Vec::new();
     for x in &p.same_pair {
         out.push(format!(
-            "this same pair was {} by a person on {}",
+            "this same pair was {} by a person on {}{}",
             verb(x),
-            day(&x.at)
+            day(&x.at),
+            because(x)
         ));
     }
     for x in &p.same_name {
         out.push(format!(
-            "\"{}\" against \"{}\" was {} by a person on {}",
+            "\"{}\" against \"{}\" was {} by a person on {}{}",
             x.left,
             x.right,
             verb(x),
-            day(&x.at)
+            day(&x.at),
+            because(x)
         ));
     }
     if let Some(t) = &p.type_pair {
@@ -211,10 +224,11 @@ pub fn render_lines(p: &Precedents) -> Vec<String> {
     }
     for x in &p.reverts {
         out.push(format!(
-            "a merge of \"{}\" into \"{}\" was reverted by a person on {}",
+            "a merge of \"{}\" into \"{}\" was reverted by a person on {}{}",
             x.left,
             x.right,
-            day(&x.at)
+            day(&x.at),
+            because(x)
         ));
     }
     out
@@ -227,7 +241,7 @@ pub fn precedents_json(p: &Precedents) -> serde_json::Value {
             .map(|x| {
                 serde_json::json!({
                     "family": family, "event_id": x.event_id, "action": x.action,
-                    "left": x.left, "right": x.right, "at": x.at,
+                    "left": x.left, "right": x.right, "at": x.at, "why": x.why,
                 })
             })
             .collect::<Vec<_>>()
@@ -333,7 +347,11 @@ pub fn name_shape(a: &str, b: &str) -> NameShape {
             if before_ok && after_ok {
                 return Some(i);
             }
-            from = i + 1;
+            // **前进一个字符，不是一个字节。** `i + 1` 落在多字节字符中间时，
+            // 下一轮的 `long[from..]` 直接 panic——中文名字一撞上就炸，而这条
+            // 路在裁决里跑，panic 掉的是整个任务：任务行永远停在 running，
+            // 没有报错、没有重试，队列静默少一格（2026-09-08 实测）
+            from = i + long[i..].chars().next().map_or(1, char::len_utf8);
         }
         None
     };
@@ -704,7 +722,12 @@ pub async fn loop_calls_today(pool: &PgPool, kb_id: Uuid) -> AppResult<i64> {
 }
 
 /// 工具：提到这个实体的原文片段——它的事实是从哪句话里抽出来的，出自哪份文档。
-/// 证据上有 quote 就用 quote，没有就截分块开头
+/// 证据上有 quote 就用 quote，没有就截分块开头。
+///
+/// **名字事实排在后面，引文就是名字本身的不要**（0041）。名字事实置信度 1.0，
+/// 按置信度排它每块都赢，而「这一块写了它的名字」的引文往往只是那个名字——
+/// 给裁决的 agent 一串光秃秃的名字，等于没给原文。带整句引文的别名（「简称海探1」）
+/// 照样留着，那正是判断是不是一个东西要看的
 pub async fn quotes_of(
     pool: &PgPool,
     kb_id: Uuid,
@@ -712,15 +735,21 @@ pub async fn quotes_of(
     limit: i64,
 ) -> AppResult<Vec<(String, String)>> {
     let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT DISTINCT ON (fe.chunk_id) d.filename,
-                COALESCE(NULLIF(fe.quote, ''), left(c.text, 240))
-         FROM facts f
-         JOIN fact_evidence fe ON fe.fact_id = f.id
-         JOIN chunks c ON c.id = fe.chunk_id
-         JOIN documents d ON d.id = c.document_id
-         WHERE f.kb_id = $1 AND f.invalidated_at IS NULL
-           AND (f.subject_id = $2 OR f.object_id = $2)
-         ORDER BY fe.chunk_id, f.confidence DESC
+        "SELECT filename, quote FROM (
+           SELECT DISTINCT ON (fe.chunk_id) d.filename,
+                  COALESCE(NULLIF(fe.quote, ''), left(c.text, 240)) AS quote
+           FROM facts f
+           -- 谓词可以为空（0010），LEFT JOIN 才不丢那些事实
+           LEFT JOIN relation_types r ON r.id = f.predicate_id
+           JOIN fact_evidence fe ON fe.fact_id = f.id
+           JOIN chunks c ON c.id = fe.chunk_id
+           JOIN documents d ON d.id = c.document_id
+           WHERE f.kb_id = $1 AND f.invalidated_at IS NULL
+             AND (f.subject_id = $2 OR f.object_id = $2)
+             AND NOT (coalesce(r.builtin AND r.key = 'known_as', false)
+                      AND lower(trim(coalesce(fe.quote, ''))) = lower(f.object_value->>'value'))
+           ORDER BY fe.chunk_id, coalesce(r.builtin AND r.key = 'known_as', false), f.confidence DESC
+         ) q
          LIMIT $3",
     )
     .bind(kb_id)
@@ -1061,6 +1090,7 @@ mod tests {
             left: "a".into(),
             right: "b".into(),
             at: Utc::now(),
+            why: None,
         }
     }
 
@@ -1280,6 +1310,19 @@ mod tests {
             Version
         );
         assert_eq!(name_shape("DeepMind Health", "DeepMind"), Extension);
+        // **中文名字不能把它炸掉。** 下面每一对都要走进「整词判定失败、
+        // 换个位置再找」那条路，而那条路从前按字节前进，落在多字节字符
+        // 中间就 panic——测试断言的是「有个答案」，不是答案是什么
+        for (a, b) in [
+            ("繪圖處理器", "繪圖"),
+            ("英伟达繪圖繪圖", "繪圖"),
+            ("北京中关村科技园", "中关村"),
+            ("東京都渋谷区", "渋谷"),
+            ("Nvidia 繪圖處理器", "繪圖"),
+        ] {
+            let _ = name_shape(a, b);
+            let _ = name_shape(b, a);
+        }
         assert_eq!(
             name_shape("Gemini Robotics-ER", "Gemini Robotics"),
             Extension

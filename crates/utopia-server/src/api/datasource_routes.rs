@@ -248,7 +248,21 @@ pub async fn sync_schema(
         Err(e) => {
             let name = source_name(&state, ds_id).await;
             crate::alerting::observe_schema_sync_failure(&state, kb_id, ds_id, &name, &e).await;
-            Err(AppError::Other(e).into())
+            // **读不出结构回 422 带引擎原话**；我们自己这边出的错（库、写文档）照旧 500。
+            // 从前一律 AppError::Other，界面只有「Internal server error」，原因只在服务端
+            // 日志里——而 Invalid 不打日志，所以这里自己记一行
+            match e.downcast_ref::<SchemaUnreadable>() {
+                Some(unreadable) => {
+                    tracing::warn!(%kb_id, %ds_id, error = %unreadable, "数据源结构读取失败");
+                    Err(AppError::invalid_detail(
+                        "schema_sync_failed",
+                        "The data source's schema could not be read",
+                        bounded(&unreadable.to_string(), 600),
+                    )
+                    .into())
+                }
+                None => Err(AppError::Other(e).into()),
+            }
         }
     }
 }
@@ -272,6 +286,27 @@ pub async fn explore(
 
 /// 拉 information_schema 生成 markdown，走三路判定摄入（同 key 原地更新）。
 /// 文档挂在 per-KB 的 "Data schemas" folder 来源下。
+/// 引擎读不出库表结构（连接、权限、catalog 不存在……），与我们自己这边出错分开：
+/// 前者是连接串或权限的事，回给点按钮的人；后者照旧是 500
+#[derive(Debug)]
+struct SchemaUnreadable(String);
+
+impl std::fmt::Display for SchemaUnreadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SchemaUnreadable {}
+
+/// 截到 `max` 个字符以内（按字符边界），引擎的报错可能带整段堆栈
+fn bounded(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text.to_string(),
+    }
+}
+
 async fn sync_schema_doc(state: &AppState, kb_id: Uuid, ds_id: Uuid) -> anyhow::Result<usize> {
     const MAX_TABLES: usize = 200;
     let name = utopia_store::datasources::list(&state.pool)
@@ -283,7 +318,8 @@ async fn sync_schema_doc(state: &AppState, kb_id: Uuid, ds_id: Uuid) -> anyhow::
     let (engine, conn) = utopia_store::datasources::engine_and_conn(&state.pool, ds_id).await?;
     let cols = crate::query_engine::engine_for(&engine, &conn)?
         .fetch_schema()
-        .await?;
+        .await
+        .map_err(|e| anyhow::Error::new(SchemaUnreadable(e.to_string())))?;
 
     let mut md = format!(
         "# Data source: {name}\n\nEngine: {engine}. Tables and columns available for SQL queries against this source; write SQL in this engine's dialect.\n"
@@ -312,7 +348,11 @@ async fn sync_schema_doc(state: &AppState, kb_id: Uuid, ds_id: Uuid) -> anyhow::
         ));
     }
 
-    // per-KB "Data schemas" 容器来源（folder：纯容器语义）
+    // per-KB "Data schemas" 容器来源（folder：纯容器语义）。
+    //
+    // **这份文档只做检索语料，不进抽取**（0035 决定 7）。它跟别的文档一样进抽取的
+    // 时候，抽取器把每个列名都当成了实体——宽表语料上四十个概念实体里二十八个是
+    // 列名（#553）。「不抽取」记在来源的 config 上，流水线读它
     let folder = match sqlx::query_as::<_, (Uuid,)>(
         "SELECT id FROM sources WHERE kb_id = $1 AND kind = 'folder' AND name = 'Data schemas'",
     )
@@ -327,7 +367,7 @@ async fn sync_schema_doc(state: &AppState, kb_id: Uuid, ds_id: Uuid) -> anyhow::
                 kb_id,
                 "folder",
                 "Data schemas",
-                &serde_json::json!({}),
+                &serde_json::json!({ "extract": false }),
                 Some("database"),
                 None,
                 None,

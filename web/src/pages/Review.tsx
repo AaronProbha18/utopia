@@ -27,18 +27,20 @@ import { useKb, useKbId } from "../kb";
 import { toast } from "../toast";
 import {
   Button,
+  CARD_ACTIONS,
   Checkbox,
   Chip,
-  type ChipTone,
-  cn,
+  GroupLabel,
   Input,
   LinkButton,
+  PageHeader,
   Pager,
   RAIL_CLS,
   RailItem,
   Segmented,
-  GroupLabel,
-  PageHeader,
+  Status,
+  cn,
+  type ChipTone,
 } from "../ui";
 
 const DUP_PAGE = 6;
@@ -53,6 +55,12 @@ function escalationText(reason: string): string {
   const [code, detail] = reason.split("|");
   const worded = S.review.escalated[code];
   if (!worded) return reason;
+  // 执行闸门（0027）留下的：detail 是 `kind value`，按 kind 措辞，不把裸代码给人看
+  if (code === "escalate_impact" && detail) {
+    const [kind, ...rest] = detail.split(" ");
+    const said = S.review.impact[kind]?.(rest.join(" "));
+    if (said) return `${worded} — ${said}`;
+  }
   return detail ? S.errDetail(worded, detail) : worded;
 }
 
@@ -64,12 +72,12 @@ function dateRange(from: string | null, to: string | null): string | null {
 function SideCard({ side }: { side: ReviewSide }) {
   return (
     <div className="flex-1 min-w-0">
-      <div className="flex items-center gap-2 mb-1">
-        <span
-          className="h-2.5 w-2.5 rounded-full shrink-0"
-          style={{ backgroundColor: side.color }}
-        />
-        <span className="text-body font-medium text-ink truncate">
+      {/* **只写名字，不画那颗色点。**色点是画布上的记号：那里一屏几十个节点，
+          颜色是唯一能一眼分开类的东西。这张卡上一共就两个实体，类名下一行
+          白纸黑字写着（「Organization · 5 facts」），点再说一遍等于重复，
+          而且把名字往右顶了一截。 */}
+      <div className="mb-1 flex items-center gap-2">
+        <span className="truncate text-body font-medium text-ink">
           {side.name}
         </span>
         {side.disambiguator && (
@@ -122,38 +130,27 @@ function DuplicateCard({
   /** 批量选中（#428）：勾在卡片左上，选了就跟着上面的批量按钮走 */
   picked: boolean;
   onPick: (picked: boolean) => void;
-  onDecide: (action: "merge" | "keep") => void;
+  /** 第二个参数是人写的那一句（0026）：什么让你这么定。可空 */
+  onDecide: (action: "merge" | "keep", rationale?: string) => void;
 }) {
   const reasonCode = item.reason?.split("|", 1)[0];
+  const [why, setWhy] = useState("");
 
   return (
     <div className={cn("glass rounded-panel p-4", picked && "u-picked")}>
-      <div className="flex gap-4">
-        <Checkbox
-          className="shrink-0 self-start"
-          checked={picked}
-          disabled={busy || locked}
-          onChange={(e) => onPick(e.target.checked)}
-          label={<span className="sr-only">{S.review.pickPair}</span>}
-        />
-        <SideCard side={item.left} />
-        <div className="self-center text-ink-2 text-body shrink-0">≟</div>
-        <SideCard side={item.right} />
-      </div>
-      <div className="mt-3 pt-3 flex items-center gap-3 border-t border-line">
+      {/* **为什么是这一对**，写在两边之前：等谁裁、类型对不对得上、agent 建议
+          什么、凭什么说它们像。读完这一行再看下面两栏，才知道该盯什么。 */}
+      <div className="mb-3 flex flex-wrap items-center gap-3">
         {locked ? (
-          <span className="u-chip u-chip-info">
-            <span className="mr-2 inline-block h-2 w-2 rounded-full bg-warn animate-pulse" />
+          <Status tone="warn" pulse>
             {S.review.agentDeciding}
-          </span>
+          </Status>
         ) : (
-          <span
-            className={`u-chip ${item.stage === "human" ? "u-chip-warn" : "u-chip-neutral"}`}
-          >
+          <Status tone={item.stage === "human" ? "warn" : "neutral"}>
             {item.stage === "human"
               ? S.review.stageHuman
               : S.review.stageAdjudicating}
-          </span>
+          </Status>
         )}
         {typesDiffer(item) && (
           <Chip tone="warn" title={S.review.typesDifferHint}>
@@ -163,7 +160,7 @@ function DuplicateCard({
             )}
           </Chip>
         )}
-        {/* agent 的建议（0025）：这里的 Merge / Keep 就是对它的回答 */}
+        {/* agent 的建议（0025）：底下的 Merge / Keep 就是对它的回答 */}
         {item.proposal && (
           <Chip tone="info" title={item.proposal.reason ?? undefined}>
             {S.review.agentSuggests(
@@ -178,24 +175,49 @@ function DuplicateCard({
           </span>
         )}
         {item.reason && (
-          <span className="text-small text-ink-2 truncate min-w-0">
+          <span className="truncate text-small text-ink-2">
             {escalationText(item.reason)}
           </span>
         )}
-        <div className="ml-auto flex gap-2 shrink-0">
-          <Button variant="secondary" size="sm"
-            disabled={busy || locked}
-            onClick={() => onDecide("keep")}
-          >
-            {S.review.keep}
-          </Button>
-          <Button variant="primary" size="sm"
-            disabled={busy || locked}
-            onClick={() => onDecide("merge")}
-          >
-            {S.review.merge}
-          </Button>
-        </div>
+      </div>
+      <div className="flex gap-4">
+        <Checkbox
+          className="shrink-0 self-start"
+          checked={picked}
+          disabled={busy || locked}
+          onChange={(v) => onPick(v)}
+          label={<span className="sr-only">{S.review.pickPair}</span>}
+        />
+        <SideCard side={item.left} />
+        <div className="self-center text-ink-2 text-body shrink-0">≟</div>
+        <SideCard side={item.right} />
+      </div>
+      {/* 页脚只剩动作，与别的卡同一副（CARD_ACTIONS）：左下，危险的排最后。
+          「为什么是这一对」搬到卡片最上面去了——它是**读这张卡之前要知道的事**，
+          不是决定之后的脚注。压在右下角的时候，人得先看完两边的事实，再把眼睛
+          甩到对角去找「凭什么说它们像」。 */}
+      <div className={cn(CARD_ACTIONS, "pt-3 border-t border-line")}>
+        {/* 理由框（0026）：可不写；写了就跟着决定进台账，下一次先例带着它 */}
+        <Input
+          size="sm"
+          className="w-56"
+          placeholder={S.review.rationalePlaceholder}
+          value={why}
+          disabled={busy || locked}
+          onChange={(e) => setWhy(e.target.value)}
+        />
+        <Button variant="primary" size="sm"
+          disabled={busy || locked}
+          onClick={() => onDecide("merge", why)}
+        >
+          {S.review.merge}
+        </Button>
+        <Button variant="secondary" size="sm"
+          disabled={busy || locked}
+          onClick={() => onDecide("keep", why)}
+        >
+          {S.review.keep}
+        </Button>
       </div>
     </div>
   );
@@ -236,7 +258,9 @@ function FactRow({
           {fact.object_name ?? "?"}
         </span>
         {range && <span className="text-small text-ink-2">({range})</span>}
-        <span className="u-chip u-chip-warn ml-auto">
+        {/* 置信度是**一个数**，不是一个状态：与这一页另外三处置信度同一副
+            素色数字。从前这里是一枚填色的琥珀胶囊，同一个数在同一页有两副样子 */}
+        <span className="ml-auto u-num text-small text-ink-2 shrink-0">
           {S.review.confidence(Math.round(fact.confidence * 100))}
         </span>
       </div>
@@ -245,18 +269,18 @@ function FactRow({
           “{fact.quote}”
         </p>
       )}
-      <div className="mt-3 flex gap-2 justify-end">
-        <Button variant="danger" size="sm"
-          disabled={busy}
-          onClick={onReject}
-        >
-          {S.review.reject}
-        </Button>
+      <div className={CARD_ACTIONS}>
         <Button variant="secondary" size="sm"
           disabled={busy}
           onClick={onConfirm}
         >
           {S.review.confirm}
+        </Button>
+        <Button variant="danger" size="sm"
+          disabled={busy}
+          onClick={onReject}
+        >
+          {S.review.reject}
         </Button>
       </div>
     </div>
@@ -312,17 +336,11 @@ function ConflictRow({
             ({S.review.conflictSince(c.new_valid_from.slice(0, 10))})
           </span>
         )}
-        <span className="u-chip u-chip-warn ml-auto">
+        <Status tone="warn" className="ml-auto shrink-0">
           {S.review.conflictReason[c.reason] ?? c.reason}
-        </span>
+        </Status>
       </div>
-      <div className="mt-3 flex items-center gap-2 justify-end">
-        <Button variant="danger" size="sm"
-          disabled={busy}
-          onClick={() => onResolve("reject_new")}
-        >
-          {S.review.rejectNew}
-        </Button>
+      <div className={CARD_ACTIONS}>
         <Button variant="secondary" size="sm"
           disabled={busy}
           onClick={() => onResolve("keep")}
@@ -343,6 +361,12 @@ function ConflictRow({
           {c.new_valid_from
             ? S.review.closeOldAt(c.new_valid_from.slice(0, 10))
             : S.review.closeOld}
+        </Button>
+        <Button variant="danger" size="sm"
+          disabled={busy}
+          onClick={() => onResolve("reject_new")}
+        >
+          {S.review.rejectNew}
         </Button>
       </div>
     </div>
@@ -397,13 +421,7 @@ function UnconfirmedRow({
           “{fact.quote}”
         </p>
       )}
-      <div className="mt-3 flex items-center gap-2 justify-end">
-        <Button variant="danger" size="sm"
-          disabled={busy}
-          onClick={onReject}
-        >
-          {S.review.reject}
-        </Button>
+      <div className={CARD_ACTIONS}>
         <Input size="sm" className="u-num w-28 text-center"
           placeholder={S.review.closeAtPlaceholder}
           value={closeAt}
@@ -418,6 +436,12 @@ function UnconfirmedRow({
           {closeAt.trim()
             ? S.review.closeFactAt(closeAt.trim())
             : S.review.closeFact}
+        </Button>
+        <Button variant="danger" size="sm"
+          disabled={busy}
+          onClick={onReject}
+        >
+          {S.review.reject}
         </Button>
       </div>
     </div>
@@ -451,9 +475,7 @@ function MergeRow({
         </div>
       </div>
       {merge.reverted_at ? (
-        <span className="u-chip u-chip-neutral shrink-0">
-          {S.review.reverted}
-        </span>
+        <Status className="shrink-0">{S.review.reverted}</Status>
       ) : (
         <Button variant="secondary" size="sm" className="shrink-0"
           disabled={busy}
@@ -493,7 +515,9 @@ function precedentText(p: AgentPrecedent): string {
       : p.action === "review.keep"
         ? S.review.agentPrecedentKept
         : S.review.agentPrecedentMerged;
-  return `${p.left} ≟ ${p.right} · ${verb} · ${p.at.slice(0, 10)}`;
+  const line = `${p.left} ≟ ${p.right} · ${verb} · ${p.at.slice(0, 10)}`;
+  // 人写的那一句（0026）跟在后面：先例不只是结果
+  return p.why ? `${line} · “${p.why}”` : line;
 }
 
 function AgentRow({
@@ -503,25 +527,26 @@ function AgentRow({
 }: {
   d: AgentDecision;
   busy: boolean;
-  onAnswer: (action: "merge" | "keep" | "revert") => void;
+  onAnswer: (action: "merge" | "keep" | "revert", rationale?: string) => void;
 }) {
   const [open, setOpen] = useState(false);
+  const [why, setWhy] = useState("");
   const precedents = d.precedents ?? [];
   const trace = d.trace ?? [];
   const hasDetail = precedents.length > 0 || trace.length > 0;
   return (
     <div className="glass rounded-panel px-4 py-3">
       <div className="flex items-center gap-3">
-        <Chip tone={AGENT_ACTION_TONE[d.action]}>{S.review.agentActions[d.action]}</Chip>
+        <Status tone={AGENT_ACTION_TONE[d.action]}>{S.review.agentActions[d.action]}</Status>
         <span className="text-body text-ink-2 truncate min-w-0">
           {d.left ?? "?"} ≟ {d.right ?? "?"}
         </span>
         <span className="u-num text-small text-ink-2 shrink-0">
           {Math.round(d.confidence * 100)}%
         </span>
-        <Chip tone={AGENT_STATUS_TONE[d.status]} className="ml-auto shrink-0">
+        <Status tone={AGENT_STATUS_TONE[d.status]} className="ml-auto shrink-0">
           {S.review.agentStatus[d.status]}
-        </Chip>
+        </Status>
       </div>
       {/* defer 留下的问题（第二刀）：这是给人看的正文，不是注脚 */}
       {d.question && (
@@ -566,24 +591,35 @@ function AgentRow({
             ? S.review.agentAnsweredBy(d.decided_by_name, (d.decided_at ?? d.created_at).slice(0, 10))
             : d.created_at.slice(0, 10)}
         </span>
-        <div className="ml-auto flex gap-2 shrink-0">
+        <div className="ml-auto flex items-center gap-2 shrink-0">
+          {/* 回答 agent 也能带一句理由（0026）——它走的正是人的裁决路径 */}
+          {(d.status === "proposed" || d.status === "applied") && (
+            <Input
+              size="sm"
+              className="w-56"
+              placeholder={S.review.rationalePlaceholder}
+              value={why}
+              disabled={busy}
+              onChange={(e) => setWhy(e.target.value)}
+            />
+          )}
           {d.status === "proposed" && (
             <>
-              <Button variant="secondary" size="sm" disabled={busy} onClick={() => onAnswer("keep")}>
+              <Button variant="secondary" size="sm" disabled={busy} onClick={() => onAnswer("keep", why)}>
                 {S.review.keep}
               </Button>
-              <Button variant="primary" size="sm" disabled={busy} onClick={() => onAnswer("merge")}>
+              <Button variant="primary" size="sm" disabled={busy} onClick={() => onAnswer("merge", why)}>
                 {S.review.merge}
               </Button>
             </>
           )}
           {d.status === "applied" && d.action === "merge" && (
-            <Button variant="secondary" size="sm" disabled={busy} onClick={() => onAnswer("revert")}>
+            <Button variant="secondary" size="sm" disabled={busy} onClick={() => onAnswer("revert", why)}>
               {S.review.revert}
             </Button>
           )}
           {d.status === "applied" && d.action === "keep" && (
-            <Button variant="secondary" size="sm" disabled={busy} onClick={() => onAnswer("merge")}>
+            <Button variant="secondary" size="sm" disabled={busy} onClick={() => onAnswer("merge", why)}>
               {S.review.merge}
             </Button>
           )}
@@ -628,6 +664,12 @@ function DecisionRow({ e }: { e: ReviewHistoryEvent }) {
         {S.review.decisionActions[e.action] ?? e.action}
       </Chip>
       <span className="text-body text-ink-2 truncate min-w-0">{text}</span>
+      {/* 人（或模型）写的那一句（0026）；老行没有 */}
+      {typeof d.why === "string" && d.why && (
+        <span className="text-small text-ink-2 truncate min-w-0">
+          “{d.why}”
+        </span>
+      )}
       {typeof d.confidence === "number" && (
         <span className="u-num text-small text-ink-2 shrink-0">
           {Math.round(d.confidence * 100)}%
@@ -715,7 +757,7 @@ function DefectRow({
           ))}
         </div>
       )}
-      <div className="mt-2 flex gap-2">
+      <div className={CARD_ACTIONS}>
         <Button variant="secondary" size="sm"
           disabled={busy}
           onClick={() => onDecide("accepted")}
@@ -757,6 +799,7 @@ function ViolationRow({
     asymmetry: S.review.violationAsymmetry,
     cycle: S.review.violationCycle,
     functional: S.review.violationFunctional,
+    inverse_functional: S.review.violationInverseFunctional,
     signature: S.review.violationSignature,
     derived_contradiction: S.review.violationDerived,
   }[v.kind];
@@ -784,7 +827,7 @@ function ViolationRow({
             {S.review.violationVia(v.predicate)}
           </span>
         )}
-        {v.path_len > 0 && (
+        {v.kind === "cycle" && v.path_len > 0 && (
           <span className="text-fine text-ink-2">
             {S.review.violationPath(v.path_len)}
           </span>
@@ -806,12 +849,12 @@ function ViolationRow({
           </div>
         ))}
       </div>
-      <div className="mt-2 flex gap-2 flex-wrap">
+      <div className={CARD_ACTIONS}>
         <Button variant="secondary" size="sm"
           disabled={busy}
           onClick={() => onDecide("accepted")}
         >
-          {S.review.acceptBoth}
+          {S.review.acceptBoth(facts.length)}
         </Button>
         <Button variant="secondary" size="sm"
           disabled={busy}
@@ -885,7 +928,7 @@ function ContradictionRow({
         </div>
       </div>
       <p className="mt-2 text-small text-ink-2">{hint}</p>
-      <div className="mt-2 flex gap-2 flex-wrap items-center">
+      <div className={CARD_ACTIONS}>
         {/* 不用日期选择器：它逼人给出一个日，而「那年结束的」正是这里常见的答案。
             写多少位就是多少精度（time.ts） */}
         <Input size="sm" className="u-num w-28 text-center"
@@ -1025,6 +1068,7 @@ export function Review() {
   // 之后勾着的东西已经不在眼前，留着会让「合并所选」合掉看不见的东西
   const [types, setTypes] = useState<ReviewTypeFilter>("any");
   const [picked, setPicked] = useState<Set<string>>(() => new Set());
+  const [batchWhy, setBatchWhy] = useState("");
   useEffect(() => setPicked(new Set()), [page, sel, types]);
 
   // 队列变化经 SSE 事件流推送（useKbEvents 挂在 Shell），无需轮询。
@@ -1074,21 +1118,42 @@ export function Review() {
   };
 
   const decide = useMutation({
-    mutationFn: ({ id, action }: { id: string; action: "merge" | "keep" }) =>
-      api.decideReview(kb!.id, id, action),
+    mutationFn: ({
+      id,
+      action,
+      rationale,
+    }: {
+      id: string;
+      action: "merge" | "keep";
+      rationale?: string;
+    }) => api.decideReview(kb!.id, id, action, rationale),
     onSettled: invalidate,
   });
   // 回答 agent 的一笔（0025）：走人的裁决路径，成为下一轮的先例
   const agentAnswer = useMutation({
-    mutationFn: ({ id, action }: { id: string; action: "merge" | "keep" | "revert" }) =>
-      api.agentAnswer(kb!.id, id, action),
+    mutationFn: ({
+      id,
+      action,
+      rationale,
+    }: {
+      id: string;
+      action: "merge" | "keep" | "revert";
+      rationale?: string;
+    }) => api.agentAnswer(kb!.id, id, action, rationale),
     onError: (e) => toast.error((e as Error).message),
     onSettled: invalidate,
   });
   // 批量裁决：一批一个动作，回来逐条说成没成；没成的留在列表里，成了的消失
   const batch = useMutation({
-    mutationFn: ({ ids, action }: { ids: string[]; action: "merge" | "keep" }) =>
-      api.reviewBatch(kb!.id, ids, action),
+    mutationFn: ({
+      ids,
+      action,
+      rationale,
+    }: {
+      ids: string[];
+      action: "merge" | "keep";
+      rationale?: string;
+    }) => api.reviewBatch(kb!.id, ids, action, rationale),
     onSuccess: (r) => {
       const failed = r.outcomes.filter((o) => o.error).length;
       if (failed > 0) toast.error(S.review.batchDone(r.decided, failed));
@@ -1097,6 +1162,7 @@ export function Review() {
     onError: (e) => toast.error((e as Error).message),
     onSettled: () => {
       setPicked(new Set());
+      setBatchWhy("");
       invalidate();
     },
   });
@@ -1456,9 +1522,9 @@ export function Review() {
                         selectable().length > 0 &&
                         selectable().every((d) => picked.has(d.id))
                       }
-                      onChange={(e) =>
+                      onChange={(v) =>
                         setPicked(
-                          e.target.checked
+                          v
                             ? new Set(selectable().map((d) => d.id))
                             : new Set(),
                         )
@@ -1470,12 +1536,25 @@ export function Review() {
                         <span className="u-num text-small text-ink-2">
                           {S.review.selected(picked.size)}
                         </span>
+                        {/* 一批一句理由（0026）：这一批为什么一起这么定 */}
+                        <Input
+                          size="sm"
+                          className="w-44"
+                          placeholder={S.review.rationalePlaceholder}
+                          value={batchWhy}
+                          disabled={batch.isPending}
+                          onChange={(e) => setBatchWhy(e.target.value)}
+                        />
                         <Button
                           variant="secondary"
                           size="sm"
                           disabled={batch.isPending}
                           onClick={() =>
-                            batch.mutate({ ids: [...picked], action: "keep" })
+                            batch.mutate({
+                              ids: [...picked],
+                              action: "keep",
+                              rationale: batchWhy,
+                            })
                           }
                         >
                           {S.review.keepSelected}
@@ -1485,7 +1564,11 @@ export function Review() {
                           size="sm"
                           disabled={batch.isPending}
                           onClick={() =>
-                            batch.mutate({ ids: [...picked], action: "merge" })
+                            batch.mutate({
+                              ids: [...picked],
+                              action: "merge",
+                              rationale: batchWhy,
+                            })
                           }
                         >
                           {S.review.mergeSelected}
@@ -1516,8 +1599,8 @@ export function Review() {
                         (decide.isPending && decide.variables?.id === item.id) ||
                         (batch.isPending && picked.has(item.id))
                       }
-                      onDecide={(action) =>
-                        decide.mutate({ id: item.id, action })
+                      onDecide={(action, rationale) =>
+                        decide.mutate({ id: item.id, action, rationale })
                       }
                     />
                   ))}
@@ -1723,7 +1806,9 @@ export function Review() {
                         key={d.id}
                         d={d}
                         busy={agentAnswer.isPending && agentAnswer.variables?.id === d.id}
-                        onAnswer={(action) => agentAnswer.mutate({ id: d.id, action })}
+                        onAnswer={(action, rationale) =>
+                          agentAnswer.mutate({ id: d.id, action, rationale })
+                        }
                       />
                     ))}
                   </div>

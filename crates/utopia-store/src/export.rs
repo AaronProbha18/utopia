@@ -67,6 +67,9 @@ pub struct ExportFact {
     pub surface_predicate: Option<String>,
     pub object_id: Option<Uuid>,
     pub object_value: Option<serde_json::Value>,
+    /// 边上的属性（0037），加载后按事实 id 补
+    #[sqlx(skip)]
+    pub qualifiers: Vec<utopia_core::models::FactQualifier>,
     pub valid_from: Option<DateTime<Utc>>,
     pub valid_from_precision: Option<String>,
     pub valid_to: Option<DateTime<Utc>>,
@@ -106,6 +109,9 @@ pub struct ExportDerived {
     pub rule_name: Option<String>,
     /// 前提事实。审计要顺着它往下走到句子
     pub premises: Vec<Uuid>,
+    /// 前提里是**另一条派生**的那些（0030）。与上面那列分开，是因为读回来的人
+    /// 要知道该去哪张表接着往下走；合成一列的话，一条链在导出里就断了
+    pub premises_derived: Vec<Uuid>,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -176,7 +182,7 @@ pub async fn facts_page(
     kb_id: Uuid,
     after: Option<Uuid>,
 ) -> AppResult<Vec<ExportFact>> {
-    Ok(sqlx::query_as(&format!(
+    let mut facts: Vec<ExportFact> = sqlx::query_as(&format!(
         "SELECT f.id, f.subject_id, f.predicate_id,
                 fact_surface_predicate(f.id) AS surface_predicate,
                 f.object_id, f.object_value,
@@ -199,7 +205,18 @@ pub async fn facts_page(
     .bind(after)
     .bind(PAGE)
     .fetch_all(pool)
-    .await?)
+    .await?;
+    // 边上的属性另一张表（0037），按事实 id 一次取回补上
+    {
+        let ids: Vec<Uuid> = facts.iter().map(|f| f.id).collect();
+        let mut by_fact = crate::graph::fact_qualifiers_for(pool, &ids).await?;
+        for f in facts.iter_mut() {
+            if let Some(q) = by_fact.remove(&f.id) {
+                f.qualifiers = q;
+            }
+        }
+    }
+    Ok(facts)
 }
 
 pub async fn derived_page(
@@ -217,7 +234,13 @@ pub async fn derived_page(
                 d.derived_at, d.invalidated_at, d.confidence,
                 COALESCE(ru.kind, 'business') AS rule, ar.name AS rule_name,
                 COALESCE(ARRAY(SELECT fd.premise_fact_id FROM fact_derivations fd
-                                WHERE fd.derived_fact_id = d.id ORDER BY fd.seq), '{}') AS premises
+                                WHERE fd.derived_fact_id = d.id
+                                  AND fd.premise_fact_id IS NOT NULL
+                                ORDER BY fd.seq), '{}') AS premises,
+                COALESCE(ARRAY(SELECT fd.premise_derived_id FROM fact_derivations fd
+                                WHERE fd.derived_fact_id = d.id
+                                  AND fd.premise_derived_id IS NOT NULL
+                                ORDER BY fd.seq), '{}') AS premises_derived
            FROM derived_facts d
            LEFT JOIN rules ru ON ru.id = d.rule_id
            LEFT JOIN attribute_rules ar ON ar.id = d.attribute_rule_id

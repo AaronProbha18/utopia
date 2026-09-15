@@ -47,6 +47,7 @@ export const en = {
       "That class is already below this one — the hierarchy would loop.",
     bad_lang: "Pick a supported language.",
     attr_needs_class: "An attribute has to belong to a class.",
+    builtin_name_attribute: "The name attribute is built in and cannot be edited.",
     attr_has_no_link:
       "An attribute has no inverse and no super-property — its value is a literal, not something to point back from.",
     link_target_is_attr:
@@ -74,6 +75,10 @@ export const en = {
     ds_name_required: "Give this data source a name.",
     only_postgres: "Only PostgreSQL is supported for now.",
     bad_conn_string: "A connection string starts with postgres://",
+    // 刷新结构失败；引擎的原话走 detail（括号里那句）
+    schema_sync_failed:
+      "The schema could not be read — the engine's own message is in parentheses. Check " +
+      "the catalog, schema and account privileges in the connection string, then try Refresh schema again.",
     concurrency_range: "Pick a number between 1 and 256.",
     inference_off:
       "Materialized inference is off for this knowledge base. Turn it on in Settings.",
@@ -109,15 +114,35 @@ export const en = {
     newPassword: "New password (min. 8 characters)",
     changePassword: "Update password",
     passwordChanged: "Password updated",
+    sso: {
+      title: "Single sign-on",
+      hint:
+        "Link your identity provider account to sign in with SSO. You'll be sent to the provider " +
+        "to confirm it's you.",
+      linkedAs: (subject: string) => `Linked as ${subject}`,
+      notLinked: "Not linked.",
+      link: "Link identity",
+      unlink: "Unlink",
+      unlinkTitle: "Unlink single sign-on?",
+      unlinkHint:
+        "You won't be able to sign in with SSO until you link again. Sessions already open stay signed in.",
+      linked: "Identity linked. You can now sign in with SSO.",
+      unlinked: "Identity unlinked.",
+    },
     avatarHint: "Avatars are generated from your name for now.",
     language: "Language",
+    theme: "Theme",
+    themeNames: { dark: "Dark", light: "Light", system: "Follow system" } as Record<"dark" | "light" | "system", string>,
     kbsNav: "Knowledge bases",
     kbsTitle: "Knowledge bases",
     kbsFilter: "Filter by name…",
     kbOpen: "Open",
     kbRestricted: "Restricted",
-    kbStats: (docs: number, members: number) =>
-      `${docs} doc${docs === 1 ? "" : "s"} · ${members} member${members === 1 ? "" : "s"}`,
+    kbNameLabel: "Knowledge base",
+    kbRoleLabel: "My role",
+    kbDocsLabel: "Docs",
+    kbMembersLabel: "Members",
+    kbAccessLabel: "Access",
     addedBy: (name: string, date: string) => `Added by ${name} · ${date}`,
     joinedOn: (date: string) => `Joined ${date}`,
     openToEveryone: "Open to everyone",
@@ -127,8 +152,7 @@ export const en = {
     /* 个人令牌页（0014 / 0016 A2）：给 agent 的钥匙，以这个人的身份行事 */
     tokensNav: "Agents & tokens",
     tokensTitle: "Personal access tokens",
-    tokensHint:
-      "A token lets an agent reach Utopia over MCP as you, never with more than you can do yourself. Read-only by default, limited to the bases you pick, revocable here at any time.",
+    tokensHint: "A token lets an agent reach Utopia over MCP as you, with no more access than you have. Read-only by default, limited to the bases you pick, revocable here.",
     newToken: "New token",
     tokenName: "Name",
     tokenNamePlaceholder: "My laptop",
@@ -296,6 +320,22 @@ export const en = {
     submitting: "One moment…",
     createAccount: "Create account",
     networkError: "Network error, please try again",
+    orDivider: "or",
+    ssoButton: "Continue with SSO",
+    ssoErrors: {
+      unlinked:
+        "This identity isn't linked to an account. Sign in with your password and link it from your account page.",
+      cancelled: "Single sign-on was cancelled.",
+      denied: "The identity provider's answer couldn't be verified.",
+      session: "The sign-in started in a different browser session. Try again.",
+      expired: "The sign-in took too long. Try again.",
+      busy: "Too many sign-ins are in progress. Try again in a moment.",
+      unavailable: "Single sign-on is unavailable right now.",
+      invalid: "The sign-in request was incomplete. Try again.",
+      taken: "That identity is already linked to another account.",
+      already_linked: "Your account already has a linked identity. Unlink it first.",
+    } as Record<string, string>,
+    ssoErrorOther: "Single sign-on failed. Try again.",
     // 惯用同意句式：By continuing, you agree to the <Terms> and acknowledge the <Privacy>.
     agreePrefix: "By continuing, you agree to the ",
     agreeAnd: " and acknowledge the ",
@@ -506,6 +546,7 @@ export const en = {
       extracting: "Extracting",
       done: "Done",
       failed: "Failed",
+      skipped: "Not extracted",
     },
     sources: "Sources",
     allDocs: "All documents",
@@ -526,8 +567,7 @@ export const en = {
       notion: "Notion",
     },
     sourceKindHints: {
-      folder:
-        "A plain folder. Select it and upload (or drag) files straight into it — nothing is watched or synced.",
+      folder: "Holds the files you upload: add, drag in and remove them here.",
       url: "Fetches the listed web pages; changed pages update the same document.",
       rss: "Subscribes to a feed; each entry becomes a document dated by its publish time.",
       jira_issues:
@@ -609,8 +649,9 @@ export const en = {
       "The first sync records what the feed holds now and imports nothing. Each item that appears after that is stored from the feed's own text when there is enough of it, otherwise from the linked article; an item with neither is listed as skipped.",
     rssFeedModeHint:
       "Stores what the feed itself carries — the entry text or its summary — and never opens the linked article.",
-    rssHydrationCounts: (pending: number, queued: number, retrying: number, complete: number, terminal: number) =>
-      `pending ${pending} · queued ${queued} · retrying ${retrying} · complete ${complete} · terminal ${terminal}`,
+    // 五个数一起读，所以收一个对象：分开传五个位置参数，调换两个不会有人发现
+    rssHydrationCounts: (c: { pending: number; queued: number; retrying: number; complete: number; terminal: number }) =>
+      `pending ${c.pending} · queued ${c.queued} · retrying ${c.retrying} · complete ${c.complete} · terminal ${c.terminal}`,
     repoField: "Repository (owner/name)",
     jiraUrlField: "Jira site URL",
     jiraProjectField: "Project key",
@@ -720,6 +761,8 @@ export const en = {
       `“${name}” and its messages will be permanently removed.`,
     deleteBtn: "Delete",
     cancel: "Cancel",
+    // 这条回答背后一条来源都没有（#547）。是事实陈述，所以每条都挂，不猜哪条该挂
+    noSources: "No sources consulted",
   },
   graph: {
     // 还没判出类型的实体（0009）。不是一个类，是"这一格还空着"
@@ -732,6 +775,7 @@ export const en = {
     legendNone: "No class matches",
     legendOnly: "Only",
     legendShowAll: (n: number) => `Show all (${n} hidden)`,
+    legendHideAll: "Hide all",
     legendAllHint:
       "Every class on screen, most common first. Click to show or hide.",
     searchMore: (n: number) => `${n} more — load 20`,
@@ -754,6 +798,7 @@ export const en = {
     evidence: "evidence",
     noEvidence: "No evidence recorded",
     noQuote: "(no quote)",
+    openInDoc: "Open the passage in the document",
     /* 抽取器从原文读出来的谓词，规范成了标识符。词表外的说法会被降级成
        related to，原意只在这里活着。
        **措辞不能宣称这是引文**：关系 key 只能是 [a-z0-9_]，所以中文语料里
@@ -786,17 +831,6 @@ export const en = {
     editSaved: "Entity updated",
     editEmptyName: "Name cannot be empty",
     /* 同名不是错误——两个张伟可以并存。只提示，不阻断 */
-    sameNameNote: (n: number) =>
-      n === 1
-        ? "One other entity shares this name."
-        : `${n} other entities share this name.`,
-    sameNameHint: "If they are the same thing, merge them under Review.",
-    mergeInto: "Merge in",
-    mergeTitle: "Merge entities",
-    mergeIntoHint:
-      "Fold that entity into this one. Its facts move here; merges can be reverted.",
-    mergeConfirm: (from: string, into: string) =>
-      `Merge “${from}” into “${into}”? Its facts move here. You can revert this from Review.`,
     viewRelations: "Relations",
     viewTimeline: "Timeline",
     /* 第三视图：记录时间轴——不是"事情何时发生"，而是"我们何时这么认为" */
@@ -881,6 +915,18 @@ export const en = {
     historicalNote: (n: number) =>
       `${n} past fact${n === 1 ? "" : "s"} not shown — see Timeline →`,
     undated: "Undated",
+    /* 实体面板的 Relations：两节的标题、组尾的折、行上的证据开关 */
+    fromEntity: (name: string) => `From ${name}`,
+    toEntity: (name: string) => `To ${name}`,
+    openEntity: (name: string) => `Open ${name}`,
+    past: (n: number) => (n === 1 ? "1 past" : `${n} past`),
+    sources: (n: number) => (n === 1 ? "1 source" : `${n} sources`),
+    /* 名字一节（0041）：本名、简称、曾用名 */
+    names: "Names",
+    shownName: "shown name",
+    nameUntil: (d: string) => `until ${d}`,
+    removeName: "Remove",
+    nameRemoved: "Name removed",
     timelineEmpty: "No dated facts yet.",
     lastConfirmed: (d: string) => `confirmed ${d}`,
     /* 三种来源共用一个标记（引擎接任对账、Review 裁决、有人手改），所以这句
@@ -892,6 +938,7 @@ export const en = {
       "The superseded assertion stays in the ledger — see History for who and when.",
     /* ---- 人工修正有效区间（302） ---- */
     editTime: "Correct the interval",
+    editTitle: "Edit entity",
     timeStart: "Start",
     timeEnd: "End",
     /* 结束端的三态，与账本里的三种写法一一对应（见迁移 0003 的注释） */
@@ -955,6 +1002,7 @@ export const en = {
     tabMembers: "Users",
     tabKbs: "Knowledge bases",
     tabDeployment: "Deployment",
+    tabSso: "Single sign-on",
     cardAccounts: "Accounts",
     newUser: "Create user",
     initialPassword: "Initial password (min. 8 characters)",
@@ -1045,6 +1093,28 @@ export const en = {
           ? "Revoked."
           : `Revoked, and unmounted it from ${n} knowledge base(s).`,
     },
+    sso: {
+      title: "Single sign-on",
+      hint:
+        "Sign-in through an identity provider (OIDC), configured with environment variables (see " +
+        ".env.example). People link their own identity from their account page; an administrator " +
+        "can see and remove links but can't create one for someone else.",
+      disabled:
+        "Not configured on this deployment. Set UTOPIA_OIDC_ISSUER, UTOPIA_OIDC_CLIENT_ID and " +
+        "UTOPIA_OIDC_REDIRECT_URI (and, if the provider needs one, UTOPIA_OIDC_CLIENT_SECRET) " +
+        "and restart.",
+      issuer: "Issuer",
+      clientId: "Client ID",
+      redirectUri: "Redirect URI",
+      colUser: "User",
+      colSubject: "Subject",
+      empty: "Nobody has linked an identity yet.",
+      unlink: "Unlink",
+      unlinkTitle: (email: string) => `Unlink ${email}?`,
+      unlinkHint:
+        "They won't be able to sign in with SSO until they link again. Sessions already open " +
+        "stay signed in; deactivate the account to cut access immediately.",
+    },
     kbs: {
       hint:
         "Every knowledge base in this deployment. Open ones are readable by all members; " +
@@ -1055,7 +1125,7 @@ export const en = {
       packsLabel: "Bundled ontologies",
       packsHint: "Optional, and more can be imported later.",
       packsPick: "Search packs…",
-      packsNone: "None — start from the ten seed relations",
+      packsNone: "None — the ontology grows out of the documents",
       packsCount: (c: number, p: number) => `${c} classes · ${p} properties`,
       name: "Name",
       description: "Description",
@@ -1082,16 +1152,36 @@ export const en = {
     testing: "Testing…",
     chatLabel: "Chat",
     embedLabel: "Embedding",
-    ok: (reply: string) => `Connected (${reply})`,
-    okDim: (dim: number) => `Connected (dim ${dim})`,
+    ok: (reply: string) => `Reachable and authenticated (${reply})`,
+    okDim: (dim: number) => `Reachable and authenticated (dim ${dim})`,
+    unsaved: "Unsaved changes. Save this card to test them.",
   },
   ontology: {
     title: "Ontology",
     hint: "Classes & properties",
     tabClasses: "Classes",
+    colName: "Name",
+    multiParentHint: "This class has more than one parent; the indentation follows one of them, and the Parent column lists them all",
+    colSignature: "Subject → Object",
+    colInstances: "Instances",
+    colFacts: "Facts",
+    colOnClass: "On class",
+    colDatatype: "Type",
+    colUnit: "Unit",
+    colSingleValued: "Single-valued",
+    yes: "Yes",
+    rowsShown: (n: number) => `${n} rows`,
+    viewTable: "Table",
+    switchToTable: "Switch to table view",
+    switchToGraph: "Switch to graph view",
+    viewDiagram: "Graph",
+    axiomTransitive: "Transitive",
+    axiomSymmetric: "Symmetric",
+    axiomAsymmetric: "Asymmetric",
+    axiomIrreflexive: "Irreflexive",
     tabProperties: "Properties",
     newClass: "New class",
-    newSubClass: "+ Sub-class",
+    newSubClass: "New sub-class",
     newProperty: "New property",
     filter: "Filter…",
     missesShort: "Unmatched",
@@ -1102,12 +1192,33 @@ export const en = {
     rulesTitle: "Business rules",
     /* 说清三件事：谁写的、结论是什么身份、什么时候重算。第三件最容易被误解成
        「保存就生效」，而它其实等下一轮物化 */
-    rulesHint:
-      "A rule reads one entity's own attributes and concludes a class or a value. " +
-      "You write the criteria — the model never proposes one. " +
-      "What a rule concludes is derived: it never replaces an asserted fact, it carries the readings that made it true, and it retires by itself when they change.",
+    rulesHint: "Rules that decide a class or compute a value from an entity's own attributes. A conclusion is derived and lapses when its premises do.",
     rulesEmpty: "No rules yet.",
+    rulesNoMatch: "No rule matches that.",
+    /** 搜的是整条规则，不只是名字——判据里的谓词和值也在里面 */
+    ruleSearch: "Search rules, attributes, values",
     ruleNew: "New rule",
+    /* 按不下去时必须说清为什么。**一条规则判的是属性的值**，没有属性就无从写起——
+       而一个灰着的按钮不解释，读者只会以为坏了 */
+    ruleNeedsAttribute:
+      "A rule tests an attribute's value, and this ontology has none yet. Open a class and add one under Attributes.",
+    ruleNeedsClass: "Add a class first — a rule concludes one.",
+    ruleColRule: "Rule",
+    ruleColDerived: "Derived",
+    ruleColStatus: "Status",
+    /* 条件之间是合取。**写「并且」而不是一个点号**——符号读不出「全都要成立」，
+       而那正是规则最容易被误读的地方 */
+    ruleAnd: "and",
+    /** 组与组之间。**读起来是「或者」而不是符号**——同一条判据的另一种满足方式 */
+    ruleOr: "or",
+    ruleWhere: "where",
+    ruleDropCondition: "Remove this condition",
+    ruleOperandPlaceholder: (kind: string): string =>
+      kind === "set"
+        ? "gas anomaly, post-effect gas anomaly"
+        : kind === "range"
+          ? "8 - 12"
+          : "12.0",
     ruleName: "Name",
     ruleNamePlaceholder: "Gas-bearing well",
     ruleDescription: "What it means (optional)",
@@ -1116,14 +1227,21 @@ export const en = {
     ruleConcludes: "Concludes",
     ruleConcludesTyping: "the class",
     ruleConcludesAttribute: "the attribute",
-    ruleConditions: "When all of",
+    /* 从前是「当以下全部成立」。**一条规则现在可以写第二种情况**，那句话就
+       不再是真的——标签退回一个「当」，全不全由下面那句说明交代 */
+    ruleConditions: "When",
+    ruleConditionsHint:
+      "The conditions in a block must all hold. Add another way and any one block is enough.",
     ruleAddCondition: "Add a condition",
+    /** 加一整块：同一条判据的另一种满足方式，不是另一条规则 */
+    ruleAddGroup: "Another way",
     ruleOpGt: "is above",
     ruleOpGte: "is at least",
     ruleOpLt: "is below",
     ruleOpLte: "is at most",
     ruleOpBetween: "is between",
     ruleOpIn: "is one of",
+    ruleOpNotIn: "is not one of",
     ruleOpPresent: "is recorded",
     ruleOperandNumber: "12.0",
     ruleOperandSet: "gas anomaly, post-effect gas anomaly",
@@ -1145,6 +1263,9 @@ export const en = {
       `${hits} matched · ${inserted} new · ${invalidated} retired`,
     ruleRunCapped: (n: number) =>
       `${n} entity/rule pairs had too many readings to expand; their conclusions are incomplete`,
+    /** 链跑满上限就停了。**说出来**：没接上的那一环与「不满足」长得一样 */
+    ruleRunRoundsCapped: (n: number): string =>
+      `Rules kept concluding after ${n} rounds; anything further down the chain was not reached`,
     ruleNeedsCondition: "A rule needs at least one condition.",
     /* ---- 打磨：可点的计数、常驻的 capped 提示、改结论 ---- */
     ruleEdit: "Edit",
@@ -1164,8 +1285,7 @@ export const en = {
     ruleCappedHint:
       "Some entities carry too many readings of the same attribute to expand every combination, so this rule's conclusions for them are incomplete.",
     refineTitle: "Refine types",
-    refineHint:
-      "Entities whose class is roughly right but not the most specific one available. Look first, then apply — retyping does not appear on any timeline, so this is the only place you get to see it before it happens.",
+    refineHint: "Narrow entity types that came out broader than they should be.",
     refinePreview: "Look first",
     refineLooking: "Looking…",
     refineRun: "Run and apply",
@@ -1191,6 +1311,15 @@ export const en = {
     attributesHint:
       "Literal-valued fields of this class (a person's salary, a contract's amount). Extracted with evidence and history, like any fact.",
     newAttribute: "New attribute",
+    /* 编辑弹窗（面板只展示，改动在弹窗里）：标题与面板里的入口 */
+    edit: "Edit",
+    editClass: "Edit class",
+    editProperty: "Edit property",
+    editAttribute: "Edit attribute",
+    connectTitle: "Connect a relationship",
+    connectOpen: "Connect an existing relationship…",
+    noDescription: "No description yet.",
+    axiomsNone: "None declared.",
     attrDatatype: "Value type",
     attrUnit: "Unit",
     attrUnitHint: "optional — e.g. CNY, %",
@@ -1208,6 +1337,11 @@ export const en = {
     shapeColor: "Shape & color",
     parent: "Parent class",
     noParent: "(top level)",
+    subclasses: "Subclasses",
+    qualifiers: "Edge attributes",
+    noQualifiers: "None",
+    qualifiersHint: "Attributes an edge of this relation may carry, e.g. amount on invested_in",
+    noSubclasses: "None",
     disjoint: "Cannot also be",
     disjointHint:
       "Classes nothing can belong to at the same time. A Person is not an Organisation. The consistency check uses this to find classes that can never have an instance.",
@@ -1267,8 +1401,7 @@ export const en = {
     /* ---- OWL / RDFS 导入 ---- */
     importShort: "Import",
     importTitle: "Import an ontology",
-    importHint:
-      "Load an OWL or RDFS file (.owl, .rdf, .ttl). Classes and properties are matched by IRI, so re-importing a newer version of the same vocabulary updates what it already created instead of duplicating it.",
+    importHint: "Import an OWL or RDFS file (.owl, .rdf, .ttl). Classes and properties are matched by IRI, so importing a newer version of the same vocabulary updates what is already here.",
     importPick: "Choose file",
     importChange: "Choose another",
     importReading: "Reading…",
@@ -1317,19 +1450,50 @@ export const en = {
     importDone: (created: number, updated: number) =>
       `Imported — ${created} classes created, ${updated} updated.`,
     importHistory: "Previous imports",
+    importColFile: "File",
+    importColFormat: "Format",
+    importColSize: "Size",
+    importColTriples: "Triples",
+    importColWhen: "Imported",
+    importDetail: "Detail",
+    importCreatedN: (n: number) => `${n} new`,
+    importUpdatedN: (n: number) => `${n} updated`,
+    importSkippedN: (n: number) => `${n} skipped`,
+    importTakenN: (n: number) => `${n} key taken`,
+    /* 细账的行名。**动词都是过去式**：这一屏说的是那一次导入做过什么 */
+    statClassesCreated: "Classes created",
+    statClassesUpdated: "Classes updated",
+    statClassesTaken: "Classes whose key was taken",
+    statClassesNoDesc: "Classes without a description",
+    statTriples: "Triples read",
+    statRelationsSeen: "Relations in the file",
+    statRelationsCreated: "Relations created",
+    statRelationsUpdated: "Relations updated",
+    statFunctional: "Relations declared functional",
+    statInverseLinked: "Inverse properties linked",
+    statSubPropertyLinked: "Sub-properties linked",
+    statAttributesSeen: "Attributes in the file",
+    statAttributesCreated: "Attributes created",
+    statAttributesSkipped: "Attributes skipped",
+    /* 跳过的理由。**每一条都要说得出下一步动哪里**，不然报了也白报 */
+    skipReason: {
+      key_taken: "key already in use",
+      unusable_range: "range cannot be a value type",
+      no_domain: "no domain — it never says which class it belongs to",
+      domain_skipped: "its domain class was skipped too",
+      unknown_domain: "domain class is not in this base",
+    } as Record<string, string | undefined>,
     importNoHistory: "No imports yet.",
     importBy: (who: string, when: string) => `${who} · ${when}`,
     importSize: (bytes: number) =>
       bytes < 1024 ? `${bytes} B` : `${(bytes / 1024).toFixed(0)} KB`,
     misses: "Unmatched from extraction",
-    missesHint:
-      "The extractor produced these outside your ontology (they fell back to concept / related to). They are signals for extending the ontology.",
+    missesHint: "Types and predicates the extractor produced outside the ontology, to judge what the ontology still lacks.",
     /* ---- 一端挂着两个以上开放值的谓词（#341） ----
        文案克制：状态一句话，后果一句话，动作在按钮上。这一档的读者要判断的是
        「这条关系一次只能有一个值吗」，不是读一篇关于双时态的说明 */
     uniqueness: "Overlapping values",
-    uniquenessHint:
-      "One holder, two values, neither closed. Until the relation says it holds one value at a time, a successor does not close a predecessor — and a question about any past date answers with both.",
+    uniquenessHint: "Say which relations may hold only one value at a time, and a new value will end the old one on its own.",
     uniquenessEmpty: "No overlaps. Every holder has at most one open value.",
     /* 主语侧 / 宾语侧：说人话，不写 functional / inverse functional */
     uniquenessSubject: (n: number) =>
@@ -1416,6 +1580,7 @@ export const en = {
     schemaLegendInheritance: "Inheritance",
     schemaLegendRelation: "Relations",
     schemaLegendDisjoint: "Disjoint",
+    schemaLegendRule: "Business rule",
     schemaUnscoped: (n: number) => `Unscoped properties (${n})`,
     schemaUnscopedHint:
       "Not limited to specific classes, so no line on the canvas would be honest. Select one to inspect or edit it.",
@@ -1442,7 +1607,8 @@ export const en = {
     schemaBundle: (n: number) => `${n} relations`,
     schemaOutgoing: "From this class",
     schemaIncoming: "To this class",
-    schemaNoRelationships: "No relationships yet.",
+    schemaNoRelationships:
+      "This class takes part in no relationships. Its inheritance is shown under Definition.",
     schemaNoInstances: "No instances yet.",
     schemaConnectHint: "Connect using an existing relationship",
     schemaConnectPlaceholder: "Search relationships…",
@@ -1452,7 +1618,7 @@ export const en = {
   },
   mapping: {
     title: "Data mapping",
-    hint: "What business concepts point at in the database, and how they are computed. Ask only answers using confirmed definitions.",
+    hint: "Which tables and columns each business concept points at, and how it is computed. Ask answers only from confirmed definitions.",
     tabDefinitions: "Definitions",
     tabSources: "Data sources",
     filterAll: "All",
@@ -1478,6 +1644,10 @@ export const en = {
     noDefinition: "(empty)",
     approve: "Confirm",
     reject: "Reject",
+    selectPage: "Select this page",
+    selectMapping: (name: string, source: string) =>
+      `Select ${name} from ${source}`,
+    selected: (n: number) => (n === 1 ? "1 selected" : `${n} selected`),
     edit: "Edit",
     editTitle: "Revise definition",
     fieldTable: "Table",
@@ -1510,6 +1680,26 @@ export const en = {
       "An agent reads these schemas and proposes metric and dimension definitions. Proposals land in Pending; Ask uses them only once confirmed.",
     exploreQueued:
       "Exploration queued — proposals will appear under Pending. If nothing can be proposed, the alert bell will say so.",
+    // **最近一轮探索的账**——单看列表答不了「漏了多少」（#503）：
+    // 十二条提议对着八十列的宽表与刚好覆盖完一个小库长得一样。这条贴出来人
+    // 才能从「等量提议」里看出覆盖范围。
+    lastRun: (r: {
+      tables: number;
+      columns: number;
+      returned: number;
+      accepted: number;
+      truncated: boolean;
+    }) => {
+      const parts = [
+        `${r.tables} tables`,
+        `${r.columns} columns`,
+        `returned ${r.returned}`,
+        `accepted ${r.accepted}`,
+      ];
+      if (r.truncated) parts.push("(schema truncated)");
+      return `Last exploration: ${parts.join(" / ")}`;
+    },
+    lastRunMissing: "No exploration has run yet.",
     sourcesEmpty: "No data sources mounted.",
     sourcesNoneAvailable:
       "No data sources registered yet — ask a deployment admin to register one.",
@@ -1622,11 +1812,16 @@ export const en = {
       escalate_no_verdict: "The adjudicator returned no verdict",
       escalate_entity_changed: "The entity changed while being adjudicated",
       escalate_unsure: "The adjudicator was not confident enough",
+      /* 抽给人看的一份（0026）：机器有把握也不动手，detail 是它本来的答案 */
+      escalate_sample: "Sampled for a person; the adjudicator was confident",
+      /* 执行闸门（0027）：合并会立刻送出图外的东西，把握再高也留给人 */
+      escalate_impact: "Held for a person; the merge would not stay in the graph",
       proposed: "The agent looked and left a proposal",
       governed: "Decided by the agent from precedent",
       namesake: "Two entities with this name in one document",
       /* 画像分不开时的并列：分数是真的，所以百分比照常显示（与 namesake 的哨兵值不同） */
       namesake_tie: "Same name, and the profiles cannot tell them apart",
+      shared_name: "Another entity already has this name",
       /* 名字互相包含：等值召回看不见，简称会静默变成第二个实体 */
       contains: "One name contains the other",
       ambiguous_name: "Same name, context did not settle it",
@@ -1634,6 +1829,12 @@ export const en = {
       auto_merged: "Merged by the AI adjudicator",
       kept_apart: "The AI adjudicator judged these different",
     } as Record<string, string>,
+    /** 闸门留下的原因，按 kind 措辞；value 是谓词标签或一个数 */
+    impact: {
+      contradiction: (p: string) => `it would put two “${p}” facts on one entity`,
+      derived: (n: string) => `${n} derived facts rest on one side`,
+      answered: (n: string) => `one side was named in ${n} answers`,
+    } as Record<string, (v: string) => string>,
     duplicates: "Possible duplicates",
     duplicatesHint:
       "Same name, different context. The AI adjudicates clear cases in the background; the rest wait for you. Merging is always reversible.",
@@ -1644,6 +1845,8 @@ export const en = {
     noFacts: "No recorded facts",
     merge: "Merge",
     keep: "Keep separate",
+    /** 理由框（0026）。是一个问题，不是一张表：可以不答 */
+    rationalePlaceholder: "What told you? Optional",
     // 重复项的类型筛选与批量裁决（#428）
     typesAny: "All",
     typesSame: "Same type",
@@ -1701,9 +1904,12 @@ export const en = {
     violationsHint:
       "Facts that contradict axioms your ontology declares. Nothing here is a guess — a predicate that declares no axioms is never checked.",
     violationSelfLoop: "Points at itself",
-    violationAsymmetry: "Both directions asserted",
+    violationAsymmetry: "Both directions hold at once",
     violationCycle: "Cycle through the transitive chain",
-    violationFunctional: "Should hold one value, holds two",
+    /** 互斥的三类只在同时成立时才报（#634），所以文案说「同一时间」 */
+    violationFunctional: "More than one value at once",
+    /** 宾语侧（#634）：同一个对象同一时间被不止一个主语指着 */
+    violationInverseFunctional: "More than one holder at once",
     /** 签名违规（#190 / #196）：一条事实的主语或宾语落在谓词声明的类型之外——
      *  抽取时会掰正，采纳与合并这两条路从前绕过了检查 */
     violationSignature: "Subject or object outside the declared types",
@@ -1730,9 +1936,10 @@ export const en = {
     retractFact: "Data is wrong",
     /** 双事实与环上的违规：撤具体哪一条（#202） */
     retractThis: "Retract",
-    retractThisHint: "Withdraw this fact from the graph; the other one stays.",
+    retractThisHint: "Withdraw this fact from the graph; the rest stay.",
     relaxAxiom: "Axiom is wrong",
-    acceptBoth: "Both are right",
+    /** 互斥组可以不止两条 */
+    acceptBoth: (n: number): string => (n > 2 ? "All are right" : "Both are right"),
     runCheck: "Run check",
     checkNeverRun:
       "Not checked yet. Contradictions are found by asking your ontology, so a run here only reports what its axioms actually say.",
@@ -1818,7 +2025,9 @@ export const en = {
       "just wait for you to approve them.",
     materialize: "Materialize inferences",
     materializeNote:
-      "Write facts the ontology entails into the ledger — transitive chains and symmetric pairs. Off by default: a declaration can be wrong, and this one changes the graph. Derived facts are marked and can be taken back.",
+      "Write facts the ontology entails into the ledger — transitive chains and symmetric pairs. " +
+      "They are marked as derived and kept in their own section, so if the declaration behind " +
+      "them turns out to be wrong, taking them back takes one click.",
     autoResolveTypes: "Resolve entity types after extraction",
     autoResolveTypesNote:
       "After each document is extracted, run a round of type resolution on entities the engine has not looked at yet. Only refinements within the current class are applied on their own — a re-classification across the tree still waits for you on the Ontology page. Every batch is listed there and can be undone.",
@@ -1937,6 +2146,9 @@ export const en = {
     deactivatedTitle: "Deactivated accounts",
     deactivatedHint:
       "They cannot sign in and do not appear in any member list. What they did is still attributed to them — that is why the account is kept rather than deleted.",
+    editMember: "Edit member",
+    close: "Close",
+    save: "Save",
     reactivate: "Restore",
     roleLabel: "Role",
     filterAll: "All users",

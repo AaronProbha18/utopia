@@ -126,6 +126,10 @@ pub struct EntitySearchQuery {
     pub limit: Option<i64>,
     #[serde(default)]
     pub offset: Option<i64>,
+    /// 记录轴：回放中的图上点搜索框，结果按**当时**的 `degree` 排（0019）。
+    /// 不给就是当下
+    #[serde(default)]
+    pub as_of: Option<String>,
 }
 
 pub async fn search_entities(
@@ -135,6 +139,8 @@ pub async fn search_entities(
     Query(query): Query<EntitySearchQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     require_kb(&state, &user, kb_id, Role::Viewer).await?;
+    // 先校验时刻：一个写错的 `as_of` 配空查询也该回 400，而不是看起来成功
+    let as_of = parse_instant("as_of", query.as_of.as_deref())?;
     if query.q.trim().is_empty() {
         return Ok(Json(json!({ "entities": [], "total": 0 })));
     }
@@ -146,6 +152,7 @@ pub async fn search_entities(
         &query.q,
         query.limit.unwrap_or(10).clamp(1, 100),
         query.offset.unwrap_or(0).max(0),
+        as_of,
     )
     .await?;
     Ok(Json(json!({ "entities": entities, "total": total })))
@@ -173,19 +180,24 @@ pub async fn entity_detail(
     // 推出来的那些**单独回一个键**，不掺进 `facts`。前端据此给它们自己的一档：
     // 一条派生边跟一条断言边混在同一个列表里，用户看不出「这条是文档里写的」
     // 和「这条是引擎推的」的区别，而那正是推理会污染知识的样子
+    // 同一个 as_of（#549）：回放中的面板上，派生那一档也是**当时**推出的
     let derived =
-        utopia_store::reasoning::derived_for_entity(&state.pool, kb_id, entity_id, None).await?;
+        utopia_store::reasoning::derived_for_entity(&state.pool, kb_id, entity_id, None, as_of)
+            .await?;
     // 同名的那些**打开面板时就给**，不是等改名之后才回。
     //
     // 从前它只随 `update_entity` 的响应回来，于是「把同名的合并进来」这个动作
     // 只有先改一次名才够得着——而两个张伟并存是「宁分勿合」的正当产物，不是
     // 改名改出来的。合并入口该长在能看见同名的地方。
-    let same_name = utopia_store::graph::same_name_peers(&state.pool, kb_id, entity_id).await?;
+    let same_name =
+        utopia_store::graph::same_name_peers(&state.pool, kb_id, entity_id, as_of).await?;
     // 没落地的派生（0017 §3）也单独一个键：它们连 `derived_facts` 都不在
     let blocked =
-        utopia_store::reasoning::blocked_for_entity(&state.pool, kb_id, entity_id).await?;
+        utopia_store::reasoning::blocked_for_entity(&state.pool, kb_id, entity_id, as_of).await?;
+    // 名字也单独一个键（0041）：本名、简称、曾用名，各带出处与有效期
+    let names = utopia_store::names::for_entity(&state.pool, kb_id, entity_id, as_of).await?;
     Ok(Json(json!({
-        "entity": entity, "facts": facts,
+        "entity": entity, "facts": facts, "names": names,
         "derived": derived, "blocked": blocked, "same_name": same_name,
     })))
 }
@@ -252,7 +264,9 @@ pub async fn update_entity(
         .await;
     }
 
-    let peers = utopia_store::graph::same_name_peers(&state.pool, kb_id, entity_id).await?;
+    // 写完之后立刻返回的同名列：这一次问的是当下，不是回放里——传 None 让它
+    // 走「今天」那条路，与面板上没在回放时一致
+    let peers = utopia_store::graph::same_name_peers(&state.pool, kb_id, entity_id, None).await?;
     state.emit_review(kb_id);
     Ok(Json(json!({ "entity": after, "same_name": peers })))
 }
@@ -474,6 +488,20 @@ pub async fn extract(
 ) -> ApiResult<Json<serde_json::Value>> {
     let doc = utopia_store::documents::get(&state.pool, document_id).await?;
     require_kb(&state, &user, doc.kb_id, Role::Editor).await?;
+    // 来源说了不抽取的（schema 文档，0035 决定 7）：说清楚为什么，而不是排一个
+    // 流水线到了那一步又跳过的任务
+    if let Some(source_id) = doc.source_id {
+        if !utopia_store::sources::get(&state.pool, source_id)
+            .await?
+            .extracts()
+        {
+            return Err(utopia_core::AppError::invalid(
+                "source_not_extracted",
+                "Documents under this source are searched, not extracted",
+            )
+            .into());
+        }
+    }
     // 手动触发 = 强制全量：清增量标记、解雇在跑的任务、置 queued、建任务，一个事务办完
     let job_id = utopia_store::documents::queue_extraction_one(&state.pool, document_id).await?;
     state.emit_document(doc.kb_id, document_id);

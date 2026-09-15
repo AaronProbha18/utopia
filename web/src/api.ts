@@ -206,6 +206,8 @@ export interface SourceView {
     base_url?: string;
     /** jira_issues：项目 key，如 KAFKA */
     project?: string;
+    /** false = 这个来源下的文档只检索、不抽取（schema 文档，0035 决定 7）；缺省抽取 */
+    extract?: boolean;
   } | null;
   icon: string | null;
   sync_interval_minutes: number | null;
@@ -216,14 +218,21 @@ export interface SourceView {
   last_sync_added: number;
   doc_count: number;
   missing_count: number;
-  rss_full_content_state: "pending" | "active" | "disabled" | null;
-  rss_full_content_generation: number | null;
-  rss_full_content_baseline_count: number | null;
-  rss_full_content_pending_count: number;
-  rss_full_content_queued_count: number;
-  rss_full_content_retrying_count: number;
-  rss_full_content_complete_count: number;
-  rss_full_content_terminal_count: number;
+  /** 全文补全那一块；**不是 RSS 全文来源的就是 null**，不用再拿 kind 与
+   *  content_mode 自己推一遍适不适用（0026 / #417） */
+  rss_full_content: RssFullContentSummary | null;
+}
+
+/** 一个 RSS 来源当前代的全文补全进度。五个计数一起读，所以一起给。 */
+export interface RssFullContentSummary {
+  state: "pending" | "active" | "disabled";
+  pending: number;
+  /** queued 与 hydrating 合成一格 */
+  queued: number;
+  retrying: number;
+  complete: number;
+  /** terminal、deleted、superseded 合成一格 */
+  terminal: number;
 }
 
 export interface SearchResult {
@@ -266,6 +275,13 @@ export interface OrgUser {
   email: string;
   display_name: string;
   is_admin: boolean;
+}
+
+/** 一个身份提供方 subject 绑定到的账号（0056） */
+export interface OidcIdentity {
+  user_id: string;
+  subject: string;
+  email: string;
 }
 
 /** 问数数据源（凭据不下发,只有 host:port/db 摘要）。 */
@@ -324,8 +340,10 @@ export interface ChunkFact {
  * 在界面上看不出区别，而那正是「推理污染知识」的样子。 */
 /** 一条条件：这个属性、这样比、跟这个值比 */
 export interface RuleCondition {
+  /** 组号：同组「与」，组间「或」（决定记录 0029）。不带 = 第 0 组 */
+  group?: number;
   predicate_id: string;
-  /** gt | gte | lt | lte | between | in | present */
+  /** gt | gte | lt | lte | between | in | not_in | present */
   op: string;
   /** 数字 / [lo,hi] / 字符串数组；present 不带 */
   operand?: unknown;
@@ -586,6 +604,8 @@ export type AgentPrecedent =
       left: string;
       right: string;
       at: string;
+      /** 人拍板时写的那一句（0026）；0026 之前的决定没有 */
+      why?: string | null;
     }
   | { family: "type_pair"; merged: number; kept: number; reverted: number };
 
@@ -621,7 +641,7 @@ export interface MappingRevision {
 /** derived_contradiction 独有（0017）：推出来的那条三元组——它没有落库，
  *  只能在这里写出来。其它种类是 `{}` */
 export interface ViolationDetail {
-  axiom?: "functional" | "asymmetry" | "self_loop";
+  axiom?: "functional" | "inverse_functional" | "asymmetry" | "self_loop";
   rule?: "transitive" | "symmetric" | "inverse" | "sub_property";
   via_label?: string;
   subject?: string;
@@ -643,6 +663,7 @@ export interface AxiomViolation {
     | "asymmetry"
     | "cycle"
     | "functional"
+    | "inverse_functional"
     | "signature"
     | "derived_contradiction";
   /** 判据来自哪条关系。判「公理写错了」时从这里进本体去改 */
@@ -652,14 +673,15 @@ export interface AxiomViolation {
   /** 自反那一类与 left 相同——一条事实跟自己矛盾 */
   right_fact: string;
   right_text: string;
-  /** 环的长度；其余三类为 0 */
+  /** `path` 的长度：环上的、互斥组里的事实，派生的前提；自环与签名为 0 */
   path_len: number;
   detected_at: string;
   detail: ViolationDetail;
   /** 审核线索（0017 §2），一次只给一条：旧断言没写结束日期、有同名实体、
    *  抽取置信度低。没有就空 */
   hint: "stale" | "duplicate" | "unsure" | null;
-  /** 环上的每一条事实，按顺序；其余种类为空。撤事实要指名撤哪条（#202） */
+  /** 环上的每一条事实（按顺序），或互斥组里的每一条（按 id）；自环与签名为空。
+   *  撤事实要指名撤哪条（#202） */
   path: { id: string; text: string }[];
 }
 /** 本体自己的一处自相矛盾。**与 AxiomViolation 不是一回事**：那个说
@@ -820,6 +842,16 @@ export interface MergeLog {
   reverted_at: string | null;
 }
 
+/** 边上的属性（0037）：`{ key: "amount", value: { value: 4e9, unit: "$" } }` */
+export interface FactQualifier {
+  qualifier_type_id: string;
+  key: string;
+  label: string;
+  value: { value?: unknown; unit?: string } | null;
+  entity_id: string | null;
+  entity_name: string | null;
+}
+
 export interface GraphEdge {
   id: string;
   source: string;
@@ -852,6 +884,22 @@ export interface GraphEdge {
   /** 幽灵边（0017 §3）：没落地的派生。`id` 是那条 `derived_contradiction` 违规的 id；
    *  `derived` 同时为 true，跟着派生开关走。点它打开主语的面板 */
   blocked: boolean;
+  /** 边上的属性（0037） */
+  qualifiers: FactQualifier[];
+}
+
+/** 实体的一个名字（0041）。`canonical` 是面板标题上那个；曾用名在世界轴上有结束 */
+export interface NameView {
+  fact_id: string;
+  name: string;
+  canonical: boolean;
+  recorded_at: string;
+  valid_from: string | null;
+  valid_from_precision: string | null;
+  valid_to: string | null;
+  valid_to_precision: string | null;
+  document_ids: string[];
+  evidence_count: number;
 }
 
 export interface EntityFact {
@@ -868,6 +916,8 @@ export interface EntityFact {
   other_name: string | null;
   /** 字面值宾语（属性事实/问数映射）：{"value":…} 或 {"summary":…} */
   object_value: Record<string, unknown> | null;
+  /** 边上的属性（0037） */
+  qualifiers: FactQualifier[];
   valid_from: string | null;
   valid_to: string | null;
   /** 读出来的区间（0022），与 GraphEdge 同义：「此刻成立」按它判 */
@@ -998,6 +1048,8 @@ export interface RelationTypeView {
   domains: string[];
   /** 可以当宾语的类。只对 relation 有意义——attribute 的值域是 datatype */
   ranges: string[];
+  /** 这条关系的边能带哪些属性（0037）：属性定义的 id */
+  qualifiers: string[];
   datatype: "text" | "number" | "date" | "bool" | null;
   unit: string | null;
   usage: number;
@@ -1106,7 +1158,7 @@ export interface PlannedItem {
   key: string;
   label: string;
   has_description: boolean;
-  disposition: "create" | "update" | "key_taken";
+  disposition: "create" | "update" | "key_taken" | "aligned" | "superseded";
   functional?: boolean;
   conflict_with?: string | null;
 }
@@ -1124,12 +1176,37 @@ export interface ImportPlan {
   functional_relations: number;
 }
 
+/** 一次导入记下的账。**键与 `owl_import.rs` 写进 `summary` 的一一对应**；
+ *  全是可选的——老记录可能缺字段，界面按缺失处理而不是显示 0 */
+export interface OntologyImportSummary {
+  classes_created?: number;
+  classes_updated?: number;
+  classes_key_taken?: number;
+  classes_without_description?: number;
+  relations_seen?: number;
+  relations_created?: number;
+  relations_superseded?: number;
+  relations_updated?: number;
+  functional_relations?: number;
+  /** 逆属性 / 父属性连上了几条——目标 IRI 不在这个库里时会静默跳过 */
+  inverse_linked?: number;
+  sub_property_linked?: number;
+  attributes_seen?: number;
+  attributes_created?: number;
+  /** **按原因分组的计数**，不是一个数：`{no_domain: 3, unknown_domain: 1}`。
+   *  跳过一个属性的理由不止一种，而理由才是人下一步要处理的东西 */
+  attributes_skipped?: Record<string, number>;
+  /** 没投影下来的 IRI 与出现次数（服务端最多记 30 条） */
+  unprojected?: [string, number][];
+  triples?: number;
+}
+
 export interface OntologyImportView {
   id: string;
   filename: string;
   format: string;
   byte_size: number;
-  summary: Record<string, unknown>;
+  summary: OntologyImportSummary;
   imported_by_name: string | null;
   imported_at: string;
 }
@@ -1149,7 +1226,17 @@ export interface Source {
 
 /** Agentic 对话的行动轨迹（工具调用一步一条）。 */
 export interface ChatStep {
-  kind: "search" | "docs" | "entity" | "facts" | "changes" | "query" | "tool";
+  kind:
+    | "search"
+    | "docs"
+    | "entity"
+    | "facts"
+    | "neighbors"
+    | "timeline"
+    | "path"
+    | "changes"
+    | "query"
+    | "tool";
   label: string;
   detail: string;
   /** `remember` 那一步带着它：那句记忆落成的 chunk。对话里的确认卡按它取
@@ -1201,10 +1288,6 @@ export type AlertGroup = {
   /** 明细，最多几条，新的在前 */
   lines: { name?: string; error?: string; job?: string }[];
 };
-
-/** 新库默认装的本体包。建库对话框和自动建出的第一个库都从这里取，
- *  两处只能有一个答案：README 承诺的是「默认 schema.org」，不是「默认没有词表」 */
-export const DEFAULT_ONTOLOGY_PACKS = ["schema-org"];
 
 export const api = {
   health: () =>
@@ -1492,6 +1575,23 @@ export const api = {
       items: ConceptMapping[];
       total: number;
       counts: { proposed: number; confirmed: number; rejected: number };
+      // 最近一轮探索的账（#503）。单看列表答不了「漏了多少」——
+      // 十二条提议对着八十列的宽表与刚好覆盖完一个小库长得一样。
+      last_run?: {
+        id: string;
+        started_at: string;
+        finished_at: string | null;
+        sources: string[];
+        tables_scanned: number;
+        columns_scanned: number;
+        schema_truncated: boolean;
+        cap: number;
+        returned: number;
+        accepted: number;
+        dropped: Record<string, { n: number; example: string }>;
+        tables_covered: string[];
+        error: string | null;
+      };
     }>(`/api/v1/kbs/${kbId}/mappings${qs ? `?${qs}` : ""}`);
   },
   /** 改一条口径。改之前那一版自动进 revisions */
@@ -1572,9 +1672,11 @@ export const api = {
     return request<{
       docs: Doc[];
       total: number;
-      /** 下面三个**只按来源作用域算**，不受名字/状态筛选影响——
+      /** 下面四个**只按来源作用域算**，不受名字/状态筛选影响——
        *  它们是批量按钮的作用范围 */
       ready: number;
+      /** `graph_status = 'done'`：抽取进度条的分子 */
+      done: number;
       extracting: number;
       failed: number;
       /** 整库的墓碑数（删了、没清的），不随作用域变 */
@@ -1657,6 +1759,9 @@ export const api = {
     request<{
       entity: GraphNode;
       facts: EntityFact[];
+      /** 这个实体的名字（0041）：本名、简称、曾用名，各带出处与有效期。
+       *  名字事实不在 facts 里——它不是一条「关于它的事」 */
+      names: NameView[];
       /** 推出来的那些**单独一个键**，不掺进 facts：混在同一个列表里，
        *  用户看不出「文档里写的」和「引擎推的」的区别 */
       derived: DerivedFact[];
@@ -1750,6 +1855,10 @@ export const api = {
       capped: number;
       inserted: number;
       invalidated: number;
+      /** 链跑了几轮：1 就是没有链，2 就是一条规则读了另一条的结论（0030） */
+      rounds: number;
+      /** 跑满上限还在产出：链比 MAX_DEPTH 长，后面那几环没接上 */
+      rounds_capped: boolean;
     }>(`/api/v1/kbs/${kbId}/rules/run`, { method: "POST" }),
 
   entityHistory: (kbId: string, entityId: string, page: number, per = 30) =>
@@ -2047,13 +2156,15 @@ export const api = {
       `/api/v1/kbs/${kbId}/review?queue=${queue}&limit=${limit}&offset=${offset}&types=${types}`,
     ),
   /** 一批重复项同一个动作（#428）：每条各自裁、各自记台账，回来逐条说成没成 */
-  reviewBatch: (kbId: string, ids: string[], action: "merge" | "keep") =>
+  /** `rationale`：人拍板时写的那一句（0026）——什么让你这么定。可不写；写了就跟着
+   *  决定一起进台账，下一次裁决器和 agent 读到的先例就不只是结果 */
+  reviewBatch: (kbId: string, ids: string[], action: "merge" | "keep", rationale?: string) =>
     request<{
       decided: number;
       outcomes: { id: string; error: string | null }[];
     }>(`/api/v1/kbs/${kbId}/review/batch`, {
       method: "POST",
-      body: JSON.stringify({ ids, action }),
+      body: JSON.stringify({ ids, action, rationale: rationale || null }),
     }),
   /** 闭合日期带精度（year | month | day）：写多少位就是多少精度，服务端照存 */
   closeFact: (kbId: string, factId: string, validTo: string, precision: string) =>
@@ -2084,10 +2195,10 @@ export const api = {
       `/api/v1/kbs/${kbId}/review/pending/${pendingId}`,
       { method: "POST", body: JSON.stringify({ action }) },
     ),
-  decideReview: (kbId: string, reviewId: string, action: "merge" | "keep") =>
+  decideReview: (kbId: string, reviewId: string, action: "merge" | "keep", rationale?: string) =>
     request<{ ok: boolean }>(`/api/v1/kbs/${kbId}/review/${reviewId}`, {
       method: "POST",
-      body: JSON.stringify({ action }),
+      body: JSON.stringify({ action, rationale: rationale || null }),
     }),
   /** 对一条数据映射口径表态（0011）。改状态不删行——拒绝留痕，下一轮探索不再提议它 */
   decideMapping: (
@@ -2111,6 +2222,8 @@ export const api = {
       found: number;
       inserted: number;
       cleared: number;
+      /** 环没搜完的谓词数（#642）。不为零时那些谓词上的环只报了一部分 */
+      cycles_capped: number;
       classes: number;
       /** 本体自己的矛盾**单独回**，不加进 found：两个数不是一类东西 */
       defects_found: number;
@@ -2131,10 +2244,10 @@ export const api = {
    *  第一个要看的就是「我们拿什么去找的」 */
   /** 手动合并：把 source 并进 target。**方向要紧**——source 消失，
    *  它的事实搬到 target 上；合并可整体回滚（entity_merges 记着快照） */
-  mergeEntities: (kbId: string, source: string, target: string) =>
+  mergeEntities: (kbId: string, source: string, target: string, rationale?: string) =>
     request<{ ok: boolean }>(`/api/v1/kbs/${kbId}/entities/merge`, {
       method: "POST",
-      body: JSON.stringify({ source, target }),
+      body: JSON.stringify({ source, target, rationale: rationale || null }),
     }),
   typeResolutionPreview: (kbId: string) =>
     request<{ items: TypeSuggestion[] }>(
@@ -2209,10 +2322,15 @@ export const api = {
     request<ReviewSummary>(`/api/v1/kbs/${kbId}/review/summary`),
   /** 回答 agent 的一笔（0025）：merge / keep 答一条建议，revert 撤回一条自动合并，
    *  merge 也能推翻一条自动分开。走的是人的裁决路径，成为新先例 */
-  agentAnswer: (kbId: string, decisionId: string, action: "merge" | "keep" | "revert") =>
+  agentAnswer: (
+    kbId: string,
+    decisionId: string,
+    action: "merge" | "keep" | "revert",
+    rationale?: string,
+  ) =>
     request<{ ok: boolean }>(`/api/v1/kbs/${kbId}/review/agent/${decisionId}`, {
       method: "POST",
-      body: JSON.stringify({ action }),
+      body: JSON.stringify({ action, rationale: rationale || null }),
     }),
   reviewHistory: (kbId: string, page: number, per = 20) =>
     request<{ events: ReviewHistoryEvent[]; total: number }>(
@@ -2243,6 +2361,30 @@ export const api = {
       chat: { ok: boolean; reply?: string; error?: string };
       embed: { ok: boolean; dim?: number; error?: string };
     }>(`/api/v1/workspaces/${workspaceId}/settings/test`, { method: "POST" }),
+
+  /** 是否配置了单点登录（0056）。四项环境变量缺一个都是 false——
+   *  登录页据此决定要不要露出那个按钮 */
+  oidcStatus: () => request<{ enabled: boolean }>("/api/v1/auth/oidc/status"),
+  /** 谁的哪个身份提供方 subject 绑定到了这个部署的哪个账号（只读 + 解绑） */
+  oidcIdentities: () =>
+    request<{
+      issuer: string;
+      client_id: string;
+      redirect_uri: string;
+      identities: OidcIdentity[];
+    }>("/api/v1/admin/oidc/identities"),
+  /** 我自己的绑定。绑定本身走 `/api/v1/auth/oidc/start?link=1`，由本人在身份提供方那边完成 */
+  oidcMe: () =>
+    request<{ enabled: boolean; linked: boolean; subject?: string | null }>(
+      "/api/v1/auth/oidc/me",
+    ),
+  oidcUnlinkMe: () =>
+    request<{ ok: boolean }>("/api/v1/auth/oidc/me", { method: "DELETE" }),
+  /** 管理员解绑。没有替人绑定的接口——那是一条冒充别人登录的路 */
+  oidcUnlink: (userId: string) =>
+    request<{ ok: boolean }>(`/api/v1/admin/oidc/identities/${userId}`, {
+      method: "DELETE",
+    }),
 };
 
 /** RAG 对话：SSE 流式。返回中止函数。 */

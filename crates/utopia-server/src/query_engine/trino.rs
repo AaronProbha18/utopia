@@ -179,6 +179,16 @@ pub(crate) fn schema_row(row: Vec<serde_json::Value>) -> SchemaColumn {
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .map(str::to_string),
+        // 键在这里一律「不知道」（#502）。三个引擎各不相同，别照 SQL 标准去读：
+        // - Trino / Presto：每个 catalog 的 `information_schema` 都由内建连接器提供，只有
+        //   columns、tables、views、schemata 与权限、角色几张表，**没有**
+        //   `table_constraints` / `key_column_usage`——查它们是 TABLE_NOT_FOUND（#682）；
+        // - Snowflake：没有 `key_column_usage`，列级的键要 `SHOW PRIMARY KEYS` /
+        //   `SHOW IMPORTED KEYS`；
+        // - Databricks：Unity Catalog 在 `information_schema.table_constraints` /
+        //   `key_column_usage` / `referential_constraints` 里登记信息性的主外键，读得到
+        is_primary_key: false,
+        references_table: None,
     }
 }
 

@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate } from "@tanstack/react-router";
 
 /* lucide 已移除品牌图标，GitHub mark 内联（官方 mark 路径，fill=currentColor） */
@@ -35,6 +35,10 @@ export function Login() {
   const [password, setPassword] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [leaving, setLeaving] = useState(false);
+  const queryClient = useQueryClient();
+  const sso = useQuery({ queryKey: ["oidc-status"], queryFn: api.oidcStatus });
+  // 单点登录回调失败时带着代码跳回这里（`?sso_error=`），措辞按代码查
+  const ssoError = new URLSearchParams(window.location.search).get("sso_error");
 
   const mutation = useMutation({
     mutationFn: async () => {
@@ -42,6 +46,9 @@ export function Login() {
       return api.register(email, password, displayName);
     },
     onSuccess: () => {
+      // 换人先清缓存：`me`、`workspaces` 这些一次会话内不过期（queryDefaults.ts），
+      // 会话过期后同一标签页登另一个账号，不清就看见上一个人的名字和库
+      queryClient.clear();
       // 谢幕：卡片上浮淡出、巨构放大穿越，再进入图谱首页
       setLeaving(true);
       window.setTimeout(() => navigate({ to: "/" }), 650);
@@ -88,6 +95,12 @@ export function Login() {
             }))}
           />
 
+          {ssoError && (
+            <p role="alert" className="mb-3 text-small text-danger">
+              {S.login.ssoErrors[ssoError] ?? S.login.ssoErrorOther}
+            </p>
+          )}
+
           <form
             className="space-y-3"
             onSubmit={(e) => {
@@ -133,6 +146,24 @@ export function Login() {
                   : S.login.createAccount}
             </Button>
           </form>
+
+          {mode === "login" && sso.data?.enabled && (
+            <>
+              <div className="my-4 flex items-center gap-3 text-fine text-ink-2">
+                <span className="h-px flex-1 bg-line" />
+                {S.login.orDivider}
+                <span className="h-px flex-1 bg-line" />
+              </div>
+              <Button variant="secondary" size="md" className="w-full"
+                disabled={leaving}
+                onClick={() => {
+                  window.location.href = "/api/v1/auth/oidc/start";
+                }}
+              >
+                {S.login.ssoButton}
+              </Button>
+            </>
+          )}
         </div>
 
         {/* 页脚：惯用同意句式内嵌条款/隐私链接 + GitHub 入口 */}

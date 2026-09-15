@@ -2,12 +2,19 @@
 //! 事件序列：step*（行动轨迹）| sources（引用清单，随检索增量更新）| delta*（增量文本）→ done | error。
 //! 模型不支持 tool-calling 时自动降级为一次性 RAG 注入。
 
-use super::tools;
+use super::agent;
+use super::rig_model::{self, RigModel};
 use crate::live::Frame;
 use axum::extract::{Path, Query, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::Json;
 use futures_util::{Stream, StreamExt};
+use rig_agent::agent::{AgentBuilder, MultiTurnStreamItem, StreamingError};
+use rig_agent::completion::PromptError;
+use rig_agent::tool::server::ToolServer;
+use rig_core::completion::{CompletionError, Document};
+use rig_core::message::Message;
+use rig_core::streaming::{StreamedAssistantContent, StreamedUserContent};
 use serde::Deserialize;
 use serde_json::json;
 use std::convert::Infallible;
@@ -139,7 +146,7 @@ pub(super) fn tools_schema(can_write: bool, data_source_names: &[String]) -> ser
 ///
 /// 判据直接取自工具表里的 `required`：加一个必填参数，这里自动跟上，
 /// 不必记得来改第二处。
-fn check_call(
+pub(super) fn check_call(
     tools: &serde_json::Value,
     name: &str,
     raw_args: &str,
@@ -306,11 +313,18 @@ pub(super) fn base_tools() -> serde_json::Value {
                     always do this for \"who was X in <year/month>\" questions. \
                     Conclusions a business rule reached about this entity come back too, \
                     marked `[rule: <name>]` with the readings that made them true — take \
-                    those as given rather than re-deriving them from the readings yourself.",
+                    those as given rather than re-deriving them from the readings yourself. \
+                    Output is grouped by predicate and cut at `limit`; narrow with predicate, \
+                    object_type, since / until, or use timeline / neighbors / paths_between.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "entity_id": { "type": "string", "description": "Entity id (uuid) from find_entities." },
+                        "entity_id": { "type": "string", "description": "Entity id (uuid) from find_entities, or an entity name (the server picks the best match and says which)." },
+                        "predicate": { "type": "string", "description": "Optional: only facts whose relation name contains this (e.g. 'founder')." },
+                        "object_type": { "type": "string", "description": "Optional: only facts whose other end is of this type (e.g. 'Person')." },
+                        "since": { "type": "string", "description": "Optional WORLD-time window start: facts still holding after it." },
+                        "until": { "type": "string", "description": "Optional WORLD-time window end: facts that had started by it." },
+                        "limit": { "type": "integer", "description": "How many facts to return (default 80, max 300); the reply says when it is cut." },
                         "at": {
                             "type": "string",
                             "description": "Optional as-of moment on the WORLD axis (YYYY, YYYY-MM, \
@@ -327,6 +341,62 @@ pub(super) fn base_tools() -> serde_json::Value {
                         }
                     },
                     "required": ["entity_id"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "paths_between",
+                "description": "How two entities are connected in the knowledge graph: the chains of facts that join them, up to 3 hops, shortest first. THE tool for 'what is the relation between A and B', 'how is X linked to Y', 'who connects A and B'. Both ends take an entity name or an id; with a name the server picks the best match and says which. Pass `at` to require every edge to hold at that moment (world time), `as_of` to read the base as recorded then. Each edge comes with its validity range.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "from": { "type": "string", "description": "One end: entity name, or an id from find_entities." },
+                        "to": { "type": "string", "description": "The other end: entity name, or an id." },
+                        "max_hops": { "type": "integer", "description": "Longest chain to consider, 1-3 (default 3)." },
+                        "at": { "type": "string", "description": "Optional WORLD-time moment (YYYY, YYYY-MM, YYYY-MM-DD): every edge on a path must hold then." },
+                        "as_of": { "type": "string", "description": "Optional RECORD-time moment: the paths as the base held them then." }
+                    },
+                    "required": ["from", "to"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "neighbors",
+                "description": "The entities linked to one entity, grouped by predicate, one hop. Use it to see what surrounds an entity before deciding where to look next (each further hop is another call); narrow with `predicate` (e.g. 'founder', 'employee') or `object_type` (e.g. 'Person'). Attribute values are not neighbors; entity_facts has them.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "entity": { "type": "string", "description": "Entity name, or an id from find_entities." },
+                        "predicate": { "type": "string", "description": "Optional: only relations whose name contains this." },
+                        "object_type": { "type": "string", "description": "Optional: only neighbors of this type (name contains)." },
+                        "at": { "type": "string", "description": "Optional WORLD-time moment: only links valid then." },
+                        "as_of": { "type": "string", "description": "Optional RECORD-time moment." },
+                        "limit": { "type": "integer", "description": "How many to return (default 40, max 300)." }
+                    },
+                    "required": ["entity"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "timeline",
+                "description": "One entity's dated facts in world-time order: THE tool for 'the timeline of X', 'the history of X', 'what happened to X between <year> and <year>'. Only facts with a stated date appear; narrow with `since` / `until` (world time) or `predicate`.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "entity": { "type": "string", "description": "Entity name, or an id from find_entities." },
+                        "since": { "type": "string", "description": "Optional start of the window (YYYY, YYYY-MM, YYYY-MM-DD)." },
+                        "until": { "type": "string", "description": "Optional end of the window." },
+                        "predicate": { "type": "string", "description": "Optional: only relations whose name contains this." },
+                        "as_of": { "type": "string", "description": "Optional RECORD-time moment: the timeline as the base held it then." },
+                        "limit": { "type": "integer", "description": "How many to return (default 60, max 300)." }
+                    },
+                    "required": ["entity"]
                 }
             }
         },
@@ -391,8 +461,14 @@ pub(super) fn base_tools() -> serde_json::Value {
 
 const SYSTEM_PROMPT: &str = "You are the assistant of Utopia, a temporal knowledge platform. \
     You have tools: search_chunks (document search) and get_document (the full text of one \
-    document found by search), find_entities, entity_facts and changes (a bi-temporal \
-    knowledge graph), and search_docs (Utopia's own manual, the Charter).\n\
+    document found by search), find_entities, entity_facts, neighbors, timeline, \
+    paths_between and changes (a bi-temporal knowledge graph), and search_docs (Utopia's \
+    own manual, the Charter).\n\
+    The knowledge base holds whatever its owners ingested: documents, and a graph extracted \
+    from them. You do not know what is in it until you look; public companies, well-known \
+    people and events are as likely to be there as private material. A question you could \
+    answer from memory is still answered from the base, and \"general knowledge\" is never a \
+    reason to skip the tools. Never say the base lacks something you have not searched for.\n\
     search_chunks returns short excerpts of the best-matching sections only. When a hit is \
     clearly the right document but the excerpt does not carry the answer, read the whole \
     document with get_document before saying the knowledge base does not have it.\n\
@@ -404,7 +480,7 @@ const SYSTEM_PROMPT: &str = "You are the assistant of Utopia, a temporal knowled
     Boundary: search_docs answers questions about Utopia itself (features, ingestion, \
     permissions, what fields like 'missing' or validity ranges mean); the other tools answer \
     questions about the knowledge stored in it. Never mix the manual into answers about the \
-    user's data unless they asked about Utopia's behavior.\n\
+    base's contents unless they asked about Utopia's behavior.\n\
     \n\
     Method:\n\
     First decide what the message is about. A message about THIS CONVERSATION — translate it, \
@@ -413,18 +489,19 @@ const SYSTEM_PROMPT: &str = "You are the assistant of Utopia, a temporal knowled
     not merely wasted work — with several entities sharing a name the second pass can land on \
     a different one, and the \"translation\" then says something else. Just deliver it — no \
     preamble about what you are or are not looking up. Everything below is for messages about \
-    the user's data.\n\
-    1. For factual questions — questions about the user's data, never one about this \
-       conversation — ALWAYS gather evidence with tools before answering. Prefer the \
-       graph tools for questions about people/organizations/projects and time (\"who was X \
-       when\", \"what changed\"), search_chunks for content and detail questions. Combine both \
-       when useful.\n\
+    the knowledge base.\n\
+    1. For factual questions — questions about the knowledge base, never one about this \
+       conversation — ALWAYS gather evidence with tools before answering. For how two \
+       things are related, call paths_between (names are fine); for the history of one \
+       thing, timeline; to see what is linked to it, neighbors; for its facts, entity_facts, \
+       narrowed with predicate / object_type / since / until. search_chunks answers content \
+       and detail questions. Combine both when useful.\n\
     2. Facts carry validity ranges (from → to). For \"as of <date>\" questions pass `at` to \
        entity_facts and the server filters to that moment; for history questions omit `at` \
        to see the full timeline. For 'what did we know / have on record / believe as of <date>' or 'before <memo> arrived' pass `as_of` — that is the record axis and the ONLY way to answer such a question; do not narrate a plan, call the tool. The two combine: `at` for the date asked about, `as_of` for when. State dates in the answer. Dates in tool output carry their own precision: \
        `2023` means the year and `2023-06` the month — never turn them into a specific day; \
-       `attested <time>` marks a fact with no stated start, known only from that evidence on; \
-       `ended by <time>` marks one the text says is over, date not given.\n\
+       `undated` marks a fact with no stated start; \
+       `ended, date unknown` marks one the text says is over, date not given.\n\
     2a. For 'before a correction or memo arrived', call changes to find its exact record timestamp, \
        then call entity_facts with `before` set to that timestamp, copied exactly as printed — the \
        server reads the base as it stood strictly before that change. Never compute an earlier \
@@ -455,11 +532,8 @@ pub async fn chat(
     //
     // 从前这里按 `confidence >= 0.75` 捞事实,而那个阈值是拿浮点数编码一个
     // 二值状态(提议 0.6 / 确认 1.0)。现在读 `status = confirmed`(0011)
-    let mappings = if mounted_sources.is_empty() {
-        Vec::new()
-    } else {
-        utopia_store::mappings::confirmed(&state.pool, kb_id, 30).await?
-    };
+    // 口径在下面按问题挑（`mapping_index::relevant`）——从前这里 `confirmed(kb, 30)`
+    // 按字典序取前三十条，一百条口径的库有七十条永远进不了提示词（#574）
     let can_write = utopia_store::access::kb_role(&state.pool, &user, &kb)
         .await?
         .is_some_and(|r| r >= Role::Editor);
@@ -475,6 +549,22 @@ pub async fn chat(
     if query.is_empty() {
         return Err(AppError::Validation("Missing user message".into()).into());
     }
+    // 语义层：跟这个问题有关的那几条确认口径进 system prompt——问数优先用确认口径，
+    // 而不是每次从 schema 猜。按问题挑而不是全塞：二十七条的上界 17/18 是在
+    // 三十条的上限之下量的，一百条口径靠字典序截断就不成立了（#574）
+    let mappings = if mounted_sources.is_empty() {
+        Vec::new()
+    } else {
+        crate::mapping_index::relevant(
+            &state,
+            kb_id,
+            kb.workspace_id,
+            &query,
+            crate::mapping_index::DEFINITIONS_IN_PROMPT,
+        )
+        .await
+        .map_err(AppError::Other)?
+    };
 
     // 会话持久化：有 id 则校验归属，无则以首句为题新建；用户消息即刻落库,
     // 上下文由服务端从库里拼——前端只送新消息
@@ -500,6 +590,11 @@ pub async fn chat(
     )
     .await?;
     let workspace_id = kb.workspace_id;
+    // 数据描述（探索从 schema 写的）与约定（人写的）跟着进 system prompt。
+    // **每次都在，不靠检索碰运气**：约定写成一页文档只靠检索也到过 14/18，
+    // 但那是因为这批问题都在问指标才每题命中（#520）
+    let data_description = kb.data_description.clone().filter(|s| !s.trim().is_empty());
+    let data_conventions = kb.data_conventions.clone().filter(|s| !s.trim().is_empty());
 
     // 注册表在生成器之前取出来：下面那个 `async_stream!` 会把 `state` 整个搬走
     let live = state.live.clone();
@@ -532,6 +627,19 @@ pub async fn chat(
                  first, then query. State units and the time range you used in the answer.",
                 ds_names.join(", ")
             ));
+            // 描述说的是 schema 里有的（粒度、单位、码值、时间轴），约定说的是 schema 里
+            // 没有的（哪些行算数、哪列才是那个数）。后者是问数从 2/18 到 14/18 的那一半
+            if let Some(d) = &data_description {
+                system_prompt.push_str(&format!(
+                    "\nAbout the data (written from the schema; states only what the schema says):\n{d}"
+                ));
+            }
+            if let Some(c) = &data_conventions {
+                system_prompt.push_str(&format!(
+                    "\nConventions stated by the owner of this base — apply them in every query \
+                     and every answer (filters, units, which column is the figure):\n{c}"
+                ));
+            }
             if !mappings.is_empty() {
                 system_prompt.push_str(
                     "\nSemantic layer (confirmed definitions — use these instead of guessing from schema):",
@@ -563,256 +671,191 @@ pub async fn chat(
                 }
             }
         }
-        let mut msgs: Vec<serde_json::Value> =
-            vec![json!({ "role": "system", "content": system_prompt })];
-        /* **上一轮做过什么，按它当时发生的位置放回去。**
-           最后那条助手消息是它的结论；带 `tool_calls` 的消息与 tool 结果
-           发生在它之前，所以插在它前面——顺序就是真实顺序，模型读起来
-           就是「我问了、我查了、我答了」。
-           少了这一段，跨轮之后它只看得见自己写的散文，于是接着说「翻译」
-           时重查一遍（还可能落到另一批同名实体上）。 */
-        let last_assistant = history
-            .turns
-            .iter()
-            .rposition(|(role, _)| role == "assistant");
-        for (i, (role, content)) in history.turns.iter().enumerate() {
-            if Some(i) == last_assistant {
-                for m in &history.last_tool_exchange {
-                    msgs.push(m.clone());
-                }
-            }
-            msgs.push(json!({ "role": role, "content": content }));
-        }
-        // **前几轮已经认下的实体，连 id 一起交回去。**
-        //
-        // 少了这一段，模型只看得见上一轮的最终答案文字，不知道自己搜过什么、
-        // 拿到过哪些 id，于是从名字重搜一遍。更隐蔽的是同名歧义时两轮可能落到
-        // **不同的实体**上，前后两个答案讲的不是同一个节点。
-        //
-        // 贴在历史之后、当前问题之前——位置就是服从性，跟抽取里 known_block
-        // 紧挨正文是同一条理由。
-        if !history.entities.is_empty() {
-            let lines: Vec<String> = history.entities
-                .iter()
-                .take(KNOWN_ENTITY_LIMIT)
-                .map(|e| {
-                    format!(
-                        "{} | {} | {}",
-                        e["id"].as_str().unwrap_or("?"),
-                        e["name"].as_str().unwrap_or("?"),
-                        e["type"].as_str().unwrap_or("?")
-                    )
-                })
-                .collect();
-            msgs.push(json!({
-                "role": "user",
-                "content": format!(
-                    "Entities already identified earlier in this conversation                      (id | name | type). Call entity_facts with these ids directly;                      do not look them up by name again:
-    {}",
-                    lines.join("
-    ")
-                )
-            }));
-        }
 
         // 会话 id 先行下发（新会话由此告知前端）
         yield Frame::new("conversation", json!({ "id": conversation_id }).to_string());
 
-        // 引用清单与这一轮认下的实体。**攒在工具外面**——`[3]` 里的 3 取决于
-        // 之前已经引过几个，各个工具各算各的会让同一个 chunk 拿到两个号
-        let mut sink = tools::ToolSink::default();
+        // 循环是 rig 的（#546）：工具、策略钩子、历史、实体清单都交给它；
+        // 这里只把它的事件翻成前端认得的帧，并在结束时落库
+        let shared = agent::Shared::new(
+            state.clone(),
+            kb_id,
+            workspace_id,
+            mounted_sources.clone(),
+            can_write,
+            user.id,
+            tools,
+            settings.chat_model.clone().unwrap_or_default(),
+            query.clone(),
+        );
+        let policy = agent::Policy {
+            shared: shared.clone(),
+            preamble: system_prompt.clone(),
+            max_rounds: MAX_ROUNDS,
+        };
+        let tool_server = ToolServer::new()
+            .dynamic_tools(agent::dynamic_tools(&shared))
+            .run();
+        let rig_agent = AgentBuilder::new(RigModel::new(client.clone()))
+            .preamble(&system_prompt)
+            // 工具轮 + 最后那一轮作答；第 MAX_ROUNDS+1 次请求由钩子撤走工具
+            .default_max_turns(MAX_ROUNDS + 1)
+            .add_hook(policy)
+            .tool_server_handle(tool_server)
+            .build();
+        let mut runner = rig_agent
+            .runner(Message::user(query.clone()))
+            .history(agent::history_messages(&history.turns, &history.last_tool_exchange));
+        // 贴在历史之后、当前问题之前——位置就是服从性，跟抽取里 known_block
+        // 紧挨正文是同一条理由（角色与位置由 `rig_model::wire` 定）
+        if let Some(block) = agent::known_entities_block(&history.entities, KNOWN_ENTITY_LIMIT) {
+            runner = runner.document(Document {
+                id: "known_entities".into(),
+                text: block,
+                additional_props: Default::default(),
+            });
+        }
+        let mut run = runner.stream().await;
+
         // 落库累积：assistant 全文与行动轨迹（历史回放用）
         let mut answer_acc = String::new();
         let mut steps_acc: Vec<serde_json::Value> = Vec::new();
-        // 这一轮的工具往返，原样留一份落库：下一轮回放它，模型才知道自己做过什么
+        // 这一轮的工具往返，按协议原样留一份落库：下一轮回放它，模型才知道自己做过什么
         let mut exchange_acc: Vec<serde_json::Value> = Vec::new();
+        // 当前模型回合里说的话与发出的调用；回合的结果一到，攒成一条 assistant 消息
+        let mut turn_text = String::new();
+        let mut turn_calls: Vec<serde_json::Value> = Vec::new();
+        let mut finished = false;
 
-        let mut rounds = 0usize;
-        loop {
-            if rounds >= MAX_ROUNDS {
-                // 弹药耗尽：命令模型就现有证据作答（流式）
-                msgs.push(json!({
-                    "role": "user",
-                    "content": "(system) Tool budget exhausted. Answer now from the evidence gathered above.",
-                }));
-                match client.chat_stream_raw(&msgs).await {
-                    Ok(deltas) => {
-                        let mut deltas = std::pin::pin!(deltas);
-                        while let Some(item) = deltas.next().await {
-                            match item {
-                                Ok(text) => { answer_acc.push_str(&text); yield delta_event(&text); }
-                                Err(e) => { yield error_event(&e.to_string()); return; }
-                            }
-                        }
-                        let _ = utopia_store::conversations::append_message(
-                            &state.pool, conversation_id, "assistant", &answer_acc,
-                            &utopia_store::conversations::TurnRecord {
-                                steps: serde_json::Value::Array(steps_acc.clone()),
-                                sources: serde_json::Value::Array(sink.sources.clone()),
-                                resolved: serde_json::Value::Array(sink.resolved.clone()),
-                                tool_exchange: serde_json::Value::Array(exchange_acc.clone()),
-                            },
-                        ).await;
-                        yield done_event();
-                    }
-                    Err(e) => yield error_event(&e.to_string()),
+        while let Some(item) = run.next().await {
+            match item {
+                Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(t))) => {
+                    answer_acc.push_str(&t.text);
+                    turn_text.push_str(&t.text);
+                    yield delta_event(&t.text);
                 }
-                return;
-            }
-
-            // 主链路全程流式：正文增量即时转发，工具调用在流末归并到达
-            let deltas = match client.chat_tools_stream(&msgs, &tools).await {
-                Ok(s) => s,
-                Err(e) => {
-                    if rounds == 0 {
-                        // 模型可能不支持 tool-calling：降级为一次性 RAG 注入
-                        tracing::warn!(error = %e, "tool-calling 不可用，降级为一次性 RAG");
-                        let chunks =
-                            retrieval::hybrid(&state, kb_id, workspace_id, &query, 8, None)
-                                .await
-                                .unwrap_or_default();
-                        let legacy_sources: Vec<serde_json::Value> = chunks
-                            .iter()
-                            .enumerate()
-                            .map(|(i, c)| source_json(i + 1, c))
-                            .collect();
-                        yield Frame::new(
-                            "sources",
-                            serde_json::to_string(&legacy_sources).unwrap_or_else(|_| "[]".into()),
-                        );
-                        let mut lmsgs =
-                            vec![json!({ "role": "system", "content": legacy_system_prompt(&chunks) })];
-                        for (role, content) in &history.turns {
-                            lmsgs.push(json!({ "role": role, "content": content }));
+                Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall {
+                    tool_call, ..
+                })) => {
+                    turn_calls.push(json!({
+                        "id": tool_call.id.as_str(),
+                        "type": "function",
+                        "function": {
+                            "name": tool_call.function.name,
+                            "arguments": rig_model::args_string(&tool_call.function.arguments),
                         }
-                        match client.chat_stream_raw(&lmsgs).await {
-                            Ok(deltas) => {
-                                let mut deltas = std::pin::pin!(deltas);
-                                while let Some(item) = deltas.next().await {
-                                    match item {
-                                        Ok(text) => { answer_acc.push_str(&text); yield delta_event(&text); }
-                                        Err(e2) => { yield error_event(&e2.to_string()); return; }
-                                    }
-                                }
-                                let _ = utopia_store::conversations::append_message(
-                                    &state.pool, conversation_id, "assistant", &answer_acc,
-                                    &utopia_store::conversations::TurnRecord {
-                                        steps: serde_json::Value::Array(steps_acc.clone()),
-                                        sources: serde_json::Value::Array(legacy_sources.clone()),
-                                        resolved: serde_json::Value::Array(sink.resolved.clone()),
-                                        tool_exchange: serde_json::Value::Array(exchange_acc.clone()),
-                                    },
-                                ).await;
-                                yield done_event();
-                            }
-                            Err(e2) => yield error_event(&e2.to_string()),
+                    }));
+                }
+                Ok(MultiTurnStreamItem::StreamUserItem(StreamedUserContent::ToolResult {
+                    tool_result,
+                    internal_call_id,
+                })) => {
+                    if !turn_calls.is_empty() {
+                        // 工具轮带了叙述文本：与后续轮次的正文之间补一个段落分隔
+                        if !turn_text.is_empty() {
+                            answer_acc.push_str("\n\n");
+                            yield delta_event("\n\n");
+                        }
+                        exchange_acc.push(json!({
+                            "role": "assistant",
+                            "content": if turn_text.is_empty() {
+                                serde_json::Value::Null
+                            } else {
+                                serde_json::Value::String(turn_text.clone())
+                            },
+                            "tool_calls": std::mem::take(&mut turn_calls),
+                        }));
+                        turn_text.clear();
+                    }
+                    let text = rig_model::tool_result_text(&tool_result.content);
+                    // 闸门工具不留轨迹：「你好」下面挂一条「声明不用查」是噪音
+                    if tool_result.name != agent::NO_EVIDENCE_TOOL {
+                        let mut step = shared.take_step(&internal_call_id).unwrap_or_else(|| {
+                            json!({ "kind": "tool", "label": tool_result.name, "detail": "unknown" })
+                        });
+                        // **这一步发生在正文的哪个位置。**
+                        //
+                        // 模型是边说边调的：说一句、查一下、再说一句。SSE 上 `delta` 与
+                        // `step` 本来就是交替发出去的，顺序不用额外记；而**历史回放没有
+                        // 那条时间线**——落库的只有拼好的整段正文和一个扁平的 steps 数组，
+                        // 于是重新打开一场对话，所有调用都堆在正文最前面，读起来像是
+                        // 先查了七次再一口气说完。记下偏移，回放才能把话再断开。
+                        //
+                        // 单位是 **UTF-16 码元**，因为切分发生在浏览器里，而 JS 的
+                        // `String.prototype.length` 数的就是它。用字节数或 `chars()`
+                        // 在中文和 emoji 上都会切歪
+                        if let Some(obj) = step.as_object_mut() {
+                            obj.insert("at".into(), json!(answer_acc.encode_utf16().count()));
+                        }
+                        steps_acc.push(step.clone());
+                        yield Frame::new("step", serde_json::to_string(&step).unwrap_or_default());
+                        if step["kind"] == "search" || step["kind"] == "docs" {
+                            let sources = shared.sink.lock().await.sources.clone();
+                            yield Frame::new(
+                                "sources",
+                                serde_json::to_string(&sources).unwrap_or_else(|_| "[]".into()),
+                            );
+                        }
+                    }
+                    exchange_acc.push(tool_result_message(tool_result.call.as_str(), &text));
+                }
+                // 钩子把一个只说不查的回合退了回去：那段话已经流给用户，收不回来；
+                // 接下来的正文另起一段
+                Ok(MultiTurnStreamItem::ModelTurnRetried { .. }) => {
+                    if !turn_text.is_empty() {
+                        answer_acc.push_str("\n\n");
+                        yield delta_event("\n\n");
+                    }
+                    turn_text.clear();
+                    turn_calls.clear();
+                }
+                Ok(MultiTurnStreamItem::FinalResponse(_)) => finished = true,
+                Ok(_) => {}
+                Err(e) => {
+                    let (message, rejected) = describe(&e);
+                    // **只有「端点拒绝了带工具的请求」才降级**为一次性 RAG。从前首轮
+                    // 的任何错误都走这条路：一次到 SiliconFlow 的网络抖动被记成
+                    // 「tool-calling 不可用」，然后 RAG 死在同一个抖动上
+                    if rejected && answer_acc.is_empty() && steps_acc.is_empty() {
+                        tracing::warn!(error = %message, "端点拒绝工具调用，降级为一次性 RAG");
+                        let mut legacy = std::pin::pin!(legacy_rag(
+                            state.clone(),
+                            kb_id,
+                            workspace_id,
+                            conversation_id,
+                            query.clone(),
+                            history.turns.clone(),
+                            client.clone(),
+                        ));
+                        while let Some(frame) = legacy.next().await {
+                            yield frame;
                         }
                         return;
                     }
-                    yield error_event(&e.to_string());
+                    yield error_event(&message);
                     return;
                 }
-            };
-            let mut turn: Option<utopia_llm::AssistantTurn> = None;
-            {
-                let mut deltas = std::pin::pin!(deltas);
-                while let Some(item) = deltas.next().await {
-                    match item {
-                        Ok(utopia_llm::ToolStreamItem::Delta(text)) => {
-                            answer_acc.push_str(&text);
-                            yield delta_event(&text);
-                        }
-                        Ok(utopia_llm::ToolStreamItem::Turn(t)) => turn = Some(t),
-                        Err(e) => {
-                            yield error_event(&e.to_string());
-                            return;
-                        }
-                    }
-                }
             }
-            let Some(turn) = turn else {
-                yield error_event("LLM stream ended unexpectedly");
-                return;
-            };
-
-            if turn.tool_calls.is_empty() {
-                if answer_acc.is_empty() {
-                    yield error_event("Model returned an empty answer");
-                } else {
-                    let _ = utopia_store::conversations::append_message(
-                        &state.pool, conversation_id, "assistant", &answer_acc,
-                        &utopia_store::conversations::TurnRecord {
-                            steps: serde_json::Value::Array(steps_acc.clone()),
-                            sources: serde_json::Value::Array(sink.sources.clone()),
-                            resolved: serde_json::Value::Array(sink.resolved.clone()),
-                            tool_exchange: serde_json::Value::Array(exchange_acc.clone()),
-                        },
-                    ).await;
-                    yield done_event();
-                }
-                return;
-            }
-
-            // 工具轮带了叙述文本：与后续轮次的正文之间补一个段落分隔
-            if turn.content.is_some() && !answer_acc.is_empty() {
-                answer_acc.push_str("\n\n");
-                yield delta_event("\n\n");
-            }
-
-            let call_msg = turn.to_message();
-            exchange_acc.push(call_msg.clone());
-            msgs.push(call_msg);
-            for call in &turn.tool_calls {
-                // **说不清自己要做什么的调用不执行。** 把话回给模型，让它重来
-                let args = match check_call(&tools, &call.name, &call.arguments) {
-                    Ok(args) => args,
-                    Err((message, step)) => {
-                        steps_acc.push(step.clone());
-                        yield Frame::new("step", serde_json::to_string(&step).unwrap_or_default());
-                        msgs.push(tool_result_message(&call.id, &message));
-                        continue;
-                    }
-                };
-                let ctx = tools::ToolCtx {
-                    state: &state,
-                    kb_id,
-                    workspace_id,
-                    mounted_sources: &mounted_sources,
-                    can_write,
-                    actor: Some(user.id),
-                    // 网页端对话不经令牌：说话的就是这个人本人
-                    via_token: None,
-                };
-                let (result, step) = tools::dispatch(&ctx, &mut sink, &call.name, &args).await;
-                // **这一步发生在正文的哪个位置。**
-                //
-                // 模型是边说边调的：说一句、查一下、再说一句。SSE 上 `delta` 与
-                // `step` 本来就是交替发出去的，顺序不用额外记；而**历史回放没有
-                // 那条时间线**——落库的只有拼好的整段正文和一个扁平的 steps 数组，
-                // 于是重新打开一场对话，所有调用都堆在正文最前面，读起来像是
-                // 先查了七次再一口气说完。记下偏移，回放才能把话再断开。
-                //
-                // 单位是 **UTF-16 码元**，因为切分发生在浏览器里，而 JS 的
-                // `String.prototype.length` 数的就是它。用字节数或 `chars()`
-                // 在中文和 emoji 上都会切歪
-                let mut step = step;
-                if let Some(obj) = step.as_object_mut() {
-                    obj.insert("at".into(), json!(answer_acc.encode_utf16().count()));
-                }
-                steps_acc.push(step.clone());
-                yield Frame::new("step", serde_json::to_string(&step).unwrap_or_default());
-                if step["kind"] == "search" || step["kind"] == "docs" {
-                    yield Frame::new(
-                        "sources",
-                        serde_json::to_string(&sink.sources).unwrap_or_else(|_| "[]".into()),
-                    );
-                }
-                let result_msg = tool_result_message(&call.id, &result);
-                exchange_acc.push(result_msg.clone());
-                msgs.push(result_msg);
-            }
-            rounds += 1;
         }
+        if !finished {
+            yield error_event("LLM stream ended unexpectedly");
+            return;
+        }
+        if answer_acc.is_empty() {
+            yield error_event("Model returned an empty answer");
+            return;
+        }
+        let sink = shared.sink.lock().await;
+        let _ = utopia_store::conversations::append_message(
+            &state.pool, conversation_id, "assistant", &answer_acc,
+            &utopia_store::conversations::TurnRecord {
+                steps: serde_json::Value::Array(steps_acc),
+                sources: serde_json::Value::Array(sink.sources.clone()),
+                resolved: serde_json::Value::Array(sink.resolved.clone()),
+                tool_exchange: serde_json::Value::Array(exchange_acc),
+            },
+        ).await;
+        yield done_event();
     };
 
     // 生成登记在案，然后**这条连接也只是去「接上」它**——与刷新之后
@@ -831,6 +874,79 @@ pub async fn chat(
     });
 
     Ok(sse_from(attached))
+}
+
+/// rig 的错误变成给用户的一句话，外加「是不是端点拒绝了工具调用」。
+/// 我们自己的错误链（限流、欠费、被拒）从 `rig_model` 里取回来，文本与从前一样
+fn describe(err: &StreamingError) -> (String, bool) {
+    fn completion(ce: &CompletionError) -> (String, bool) {
+        match rig_model::llm_failure(ce) {
+            Some(ours) => (ours.to_string(), rig_model::tool_calling_rejected(ce)),
+            None => (ce.to_string(), false),
+        }
+    }
+    match err {
+        StreamingError::Completion(ce) => completion(ce),
+        StreamingError::Prompt(pe) => match pe.as_ref() {
+            PromptError::CompletionError(ce) => completion(ce),
+            PromptError::PromptCancelled { reason, .. } => (reason.clone(), false),
+            other => (other.to_string(), false),
+        },
+    }
+}
+
+/// 降级路径：端点不支持工具调用时的一次性 RAG 注入。
+/// 检索一次、把来源塞进系统提示、流式作答、落库
+fn legacy_rag(
+    state: AppState,
+    kb_id: Uuid,
+    workspace_id: Uuid,
+    conversation_id: Uuid,
+    query: String,
+    turns: Vec<(String, String)>,
+    client: utopia_llm::LlmClient,
+) -> impl Stream<Item = Frame> {
+    async_stream::stream! {
+        let chunks = retrieval::hybrid(&state, kb_id, workspace_id, &query, 8, None)
+            .await
+            .unwrap_or_default();
+        let legacy_sources: Vec<serde_json::Value> = chunks
+            .iter()
+            .enumerate()
+            .map(|(i, c)| source_json(i + 1, c))
+            .collect();
+        yield Frame::new(
+            "sources",
+            serde_json::to_string(&legacy_sources).unwrap_or_else(|_| "[]".into()),
+        );
+        let mut lmsgs = vec![json!({ "role": "system", "content": legacy_system_prompt(&chunks) })];
+        for (role, content) in &turns {
+            lmsgs.push(json!({ "role": role, "content": content }));
+        }
+        let mut answer_acc = String::new();
+        match client.chat_stream_raw(&lmsgs).await {
+            Ok(deltas) => {
+                let mut deltas = std::pin::pin!(deltas);
+                while let Some(item) = deltas.next().await {
+                    match item {
+                        Ok(text) => { answer_acc.push_str(&text); yield delta_event(&text); }
+                        Err(e) => { yield error_event(&e.to_string()); return; }
+                    }
+                }
+                let _ = utopia_store::conversations::append_message(
+                    &state.pool, conversation_id, "assistant", &answer_acc,
+                    &utopia_store::conversations::TurnRecord {
+                        steps: serde_json::Value::Array(Vec::new()),
+                        sources: serde_json::Value::Array(legacy_sources),
+                        resolved: serde_json::Value::Array(Vec::new()),
+                        tool_exchange: serde_json::Value::Array(Vec::new()),
+                    },
+                ).await;
+                yield done_event();
+            }
+            Err(e) => yield error_event(&e.to_string()),
+        }
+    }
 }
 
 /// 把一次「接上」变成 SSE：先补一份快照，再照常收增量。
@@ -1154,3 +1270,7 @@ mod tests {
             .expect("格式错的日期不归这一关管，交给 changes_window");
     }
 }
+
+#[cfg(test)]
+#[path = "chat_empty_reply_tests.rs"]
+mod chat_empty_reply_tests;

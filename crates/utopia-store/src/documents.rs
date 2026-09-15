@@ -18,6 +18,61 @@ pub async fn create(
     doc_time: Option<chrono::DateTime<chrono::Utc>>,
     external_key: Option<&str>,
 ) -> AppResult<Document> {
+    create_with_time_source(
+        pool,
+        kb_id,
+        filename,
+        mime,
+        size_bytes,
+        sha256,
+        source_id,
+        doc_time,
+        "source",
+        external_key,
+    )
+    .await
+}
+
+/// 正文识别只属于文件上传；JSON ingest 和同步传来的日期仍用原来的 source 语义。
+#[allow(clippy::too_many_arguments)]
+pub async fn create_from_upload(
+    pool: &PgPool,
+    kb_id: Uuid,
+    filename: &str,
+    mime: &str,
+    size_bytes: i64,
+    sha256: &str,
+    source_id: Option<Uuid>,
+    content_time: Option<DateTime<Utc>>,
+) -> AppResult<Document> {
+    create_with_time_source(
+        pool,
+        kb_id,
+        filename,
+        mime,
+        size_bytes,
+        sha256,
+        source_id,
+        content_time,
+        "content",
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_with_time_source(
+    pool: &PgPool,
+    kb_id: Uuid,
+    filename: &str,
+    mime: &str,
+    size_bytes: i64,
+    sha256: &str,
+    source_id: Option<Uuid>,
+    doc_time: Option<DateTime<Utc>>,
+    time_source: &str,
+    external_key: Option<&str>,
+) -> AppResult<Document> {
     // 同样的内容回来了，而它只是被删过：复活那一篇，而不是撞 (kb_id, sha256) 的唯一
     // 索引报「已存在」。撤销删除的一种自然形态——重传就是「我要它回来」（#268）
     if let Some((id,)) = sqlx::query_as::<_, (Uuid,)>(
@@ -45,7 +100,7 @@ pub async fn create(
     .bind(source_id)
     .bind(doc_time)
     .bind(if doc_time.is_some() {
-        "source"
+        time_source
     } else {
         "upload_time"
     })
@@ -358,16 +413,6 @@ pub async fn upsert_source_document_tx(
     Ok(document)
 }
 
-pub async fn list(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<Document>> {
-    let rows = sqlx::query_as(
-        "SELECT * FROM documents WHERE kb_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC",
-    )
-    .bind(kb_id)
-    .fetch_all(pool)
-    .await?;
-    Ok(rows)
-}
-
 /// 文库一页，**带筛选与统计**。
 ///
 /// 从前是 `SELECT * FROM documents WHERE kb_id = $1` 不带上限、前端客户端分页。
@@ -409,7 +454,7 @@ pub async fn page(
 
     let docs: Vec<Document> = sqlx::query_as(&format!(
         "SELECT * FROM documents {WHERE}
-         ORDER BY (CASE WHEN $5::bool THEN deleted_at ELSE created_at END) DESC
+         ORDER BY (CASE WHEN $5::bool THEN deleted_at ELSE created_at END) DESC, id DESC
          LIMIT $6 OFFSET $7"
     ))
     .bind(kb_id)
@@ -431,10 +476,14 @@ pub async fn page(
         .fetch_one(pool)
         .await?;
 
-    // 统计只按来源作用域算：那两个批量按钮作用于整个来源，不是你搜出来的那几条
-    let stats: (i64, i64, i64) = sqlx::query_as(
+    // 统计只按来源作用域算：那两个批量按钮作用于整个来源，不是你搜出来的那几条。
+    // 四个数各对应一列：`ready` 是摄入（`status`），后三个是抽取（`graph_status`）。
+    // 两个维度不能相加——一篇「摄入已完成、图谱还在抽」的文档两边都占，进度条若拿
+    // `ready + extracting` 当分母，两篇文档会显示成 2 / 4
+    let stats: (i64, i64, i64, i64) = sqlx::query_as(
         "SELECT
            count(*) FILTER (WHERE status = 'ready'),
+           count(*) FILTER (WHERE graph_status = 'done'),
            count(*) FILTER (WHERE graph_status IN ('queued', 'extracting')),
            count(*) FILTER (WHERE graph_status = 'failed')
          FROM documents
@@ -461,8 +510,9 @@ pub async fn page(
         docs,
         total,
         ready: stats.0,
-        extracting: stats.1,
-        failed: stats.2,
+        done: stats.1,
+        extracting: stats.2,
+        failed: stats.3,
         deleted: deleted_total,
     })
 }
@@ -777,11 +827,15 @@ pub async fn delete(
     .bind(id)
     .fetch_all(&mut *tx)
     .await?;
+    // 作废的事实可能是别的值的后任：它走了，关在它开始时的前任要重新接上；没作废、只是
+    // 少了这份证据的，排序用的日期也可能变。牵连的时间线先按固定顺序锁上，再作废任何一行
+    // （与撤回合并同一个顺序，见 temporal 模块头）
+    let (cited, timelines) = lock_cited_timelines(&mut tx, kb_id, id, &[]).await?;
     // 先打了墓碑再算：这篇文档此刻已经算「已删除」，所以只剩它作出处的事实才落网；
     // 另一篇活着的文档里也有证据的一条不动——删一份重复上传不该掀掉半张图
     let facts: Vec<(Uuid,)> = sqlx::query_as(
         "UPDATE facts f SET invalidated_at = now()
-          WHERE f.kb_id = $1 AND f.invalidated_at IS NULL
+          WHERE f.kb_id = $1 AND f.invalidated_at IS NULL AND f.id = ANY($3)
             AND EXISTS (SELECT 1 FROM fact_evidence fe
                         JOIN chunks c ON c.id = fe.chunk_id
                         WHERE fe.fact_id = f.id AND c.document_id = $2)
@@ -789,14 +843,23 @@ pub async fn delete(
                             JOIN chunks c ON c.id = fe.chunk_id
                             JOIN documents d ON d.id = c.document_id
                             WHERE fe.fact_id = f.id AND d.deleted_at IS NULL)
+            -- 实体的本名不随文档走（0041）：建实体时就记下了这条名字事实，这篇文档只是
+            -- 给它补过出处。删掉出处，实体还叫这个名字，名字栏里不能少了它
+            AND NOT EXISTS (SELECT 1 FROM relation_types nr
+                             JOIN entities ne ON ne.id = f.subject_id
+                            WHERE nr.id = f.predicate_id AND nr.builtin AND nr.key = 'known_as'
+                              AND lower(f.object_value->>'value') = lower(ne.canonical_name))
           RETURNING f.id",
     )
     .bind(kb_id)
     .bind(id)
+    .bind(&cited)
     .fetch_all(&mut *tx)
     .await?;
     let chunk_ids: Vec<Uuid> = chunks.into_iter().map(|(c,)| c).collect();
     let fact_ids: Vec<Uuid> = facts.into_iter().map(|(f,)| f).collect();
+    reattest_tx(&mut tx, &cited).await?;
+    crate::temporal::tidy_timelines_tx(&mut tx, kb_id, &timelines).await?;
     let deletion_id = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO document_deletions
@@ -819,6 +882,77 @@ pub async fn delete(
         invalidated_facts: fact_ids.len(),
         superseded_chunks: chunk_ids.len(),
     })
+}
+
+/// 证据文档变了（删了一篇、撤销了删除），把这些事实的「最早证据日期」按还在的文档重算。
+///
+/// 读路径拿它当没起点的事实从哪天起成立（`facts_holds_from`），引擎排时间线用的是同一个
+/// 日期（`temporal::DATED_AT`）。删掉最早那份文档之后引擎的锚点挪到了第二份，这里不跟着
+/// 挪的话，前任读到新锚点为止、它却还从旧日期读起，两段叠了一年（#679 第四轮评审）。
+/// 一份带日期的文档都不剩的，保留原值——那是别的来源（人写的）给的日期
+async fn reattest_tx(tx: &mut Transaction<'_, Postgres>, fact_ids: &[Uuid]) -> AppResult<()> {
+    if fact_ids.is_empty() {
+        return Ok(());
+    }
+    sqlx::query(
+        "UPDATE facts f SET attested_from = e.first
+           FROM (SELECT fe.fact_id, min(d.doc_time) AS first
+                   FROM fact_evidence fe
+                   JOIN chunks c ON c.id = fe.chunk_id
+                   JOIN documents d ON d.id = c.document_id
+                  WHERE fe.fact_id = ANY($1) AND d.deleted_at IS NULL AND d.doc_time IS NOT NULL
+                  GROUP BY fe.fact_id) e
+          WHERE f.id = e.fact_id AND f.invalidated_at IS NULL
+            AND f.attested_from IS DISTINCT FROM e.first",
+    )
+    .bind(fact_ids)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// 引用这篇文档的现存事实，连同它们所在的唯一性时间线，锁上之后返回。
+///
+/// **锁上之后再读一遍**（#679 第三轮评审）：等锁的时候，时间线重算可能把其中一行改写成了
+/// 新的一行，头一遍读到的是旧 id——拿旧名单去作废，新的那一行就活下来，出处却已经删了。
+/// 改写只在时间线的锁里发生，锁上之后名单不会再变；再读出来的行若落在没锁上的时间线上
+/// （撤回合并把它送回了源实体），把那几条也锁上
+///
+/// `also`：一并要锁的别的事实（撤销删除时要复活的那些）。**一次锁齐**：先锁引用的、
+/// 再锁复活的，分两轮拿锁的话，另一个按顺序拿同样两把锁的事务会和它互相等死
+async fn lock_cited_timelines(
+    tx: &mut Transaction<'_, Postgres>,
+    kb_id: Uuid,
+    document_id: Uuid,
+    also: &[Uuid],
+) -> AppResult<(Vec<Uuid>, Vec<crate::temporal::Timeline>)> {
+    let cited_sql = "SELECT DISTINCT f.id FROM facts f
+                       JOIN fact_evidence fe ON fe.fact_id = f.id
+                       JOIN chunks c ON c.id = fe.chunk_id
+                      WHERE f.kb_id = $1 AND f.invalidated_at IS NULL AND c.document_id = $2";
+    let cited: Vec<Uuid> = sqlx::query_scalar(cited_sql)
+        .bind(kb_id)
+        .bind(document_id)
+        .fetch_all(&mut **tx)
+        .await?;
+    let first: Vec<Uuid> = cited.iter().chain(also).copied().collect();
+    let mut timelines = crate::temporal::timelines_of(&mut **tx, kb_id, &first, None).await?;
+    crate::temporal::lock_timelines(tx, kb_id, &timelines).await?;
+    let cited: Vec<Uuid> = sqlx::query_scalar(cited_sql)
+        .bind(kb_id)
+        .bind(document_id)
+        .fetch_all(&mut **tx)
+        .await?;
+    let late: Vec<_> = crate::temporal::timelines_of(&mut **tx, kb_id, &cited, None)
+        .await?
+        .into_iter()
+        .filter(|t| !timelines.contains(t))
+        .collect();
+    if !late.is_empty() {
+        crate::temporal::lock_timelines(tx, kb_id, &late).await?;
+        timelines.extend(late);
+    }
+    Ok((cited, timelines))
 }
 
 /// 撤销一次删除：文档、这次打标的分块、这次作废的事实原路复活，形状照 `revert_merge`。
@@ -880,6 +1014,9 @@ async fn restore_tx(
         .bind(&chunk_ids)
         .execute(&mut **tx)
         .await?;
+    // 复活的事实回到各自的时间线上；一直引用着这篇文档的事实，排序用的日期也回来了。
+    // 先锁、再复活、再重算（同删除）
+    let (cited, timelines) = lock_cited_timelines(tx, kb_id, id, &fact_ids).await?;
     sqlx::query(
         "UPDATE facts SET invalidated_at = NULL
           WHERE id = ANY($1) AND invalidated_at IS NOT NULL",
@@ -887,6 +1024,9 @@ async fn restore_tx(
     .bind(&fact_ids)
     .execute(&mut **tx)
     .await?;
+    let touched: Vec<Uuid> = cited.iter().chain(&fact_ids).copied().collect();
+    reattest_tx(tx, &touched).await?;
+    crate::temporal::tidy_timelines_tx(tx, kb_id, &timelines).await?;
     sqlx::query("UPDATE document_deletions SET reverted_at = now() WHERE id = $1")
         .bind(deletion_id)
         .execute(&mut **tx)
@@ -970,20 +1110,23 @@ pub async fn purge(pool: &PgPool, kb_id: Uuid, id: Uuid) -> AppResult<PurgeRepor
     .bind(id)
     .execute(&mut *tx)
     .await?;
-    // 原文按内容寻址，别的文档（任何库）可能共用同一份：只交出没人再引用的
-    let mut blobs = Vec::new();
-    for s in shas {
-        let (referenced,): (bool,) = sqlx::query_as(
-            "SELECT EXISTS (SELECT 1 FROM documents WHERE sha256 = $1 AND purged_at IS NULL)
-                 OR EXISTS (SELECT 1 FROM document_versions WHERE sha256 = $1)",
-        )
-        .bind(&s)
-        .fetch_one(&mut *tx)
-        .await?;
-        if !referenced {
-            blobs.push(s);
-        }
-    }
+    // 原文按内容寻址，别的文档（任何库）可能共用同一份：只交出没人再引用的。
+    //
+    // **一句话判完所有指纹，而且必须站在这个位置。** 判断看的是版本行删掉之后的
+    // 状态：这篇文档的旧版本不再算引用，它独占的原文才收得回来。把这一问挪到
+    // 删除之前，每份原文都显得有人引用、永远交不出去，而且不报任何错（#516）。
+    // 从前每个指纹各问一次，一篇重解析过三十次的文档就是三十个往返，全在已握着
+    // 来源锁与文档行锁的事务里；现在是一个往返，两问各走 0043 的 sha 索引。
+    // 名单顺序照 shas：现行指纹排在历史之后，与从前一样。
+    let blobs: Vec<String> = sqlx::query_scalar(
+        "SELECT s FROM unnest($1::text[]) WITH ORDINALITY AS u(s, n)
+          WHERE NOT EXISTS (SELECT 1 FROM documents WHERE sha256 = s AND purged_at IS NULL)
+            AND NOT EXISTS (SELECT 1 FROM document_versions WHERE sha256 = s)
+          ORDER BY n",
+    )
+    .bind(&shas)
+    .fetch_all(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(PurgeReport { blobs, chunks })
 }
@@ -1031,7 +1174,8 @@ pub async fn replace_chunks(
         let claimed = claim_pool.get_mut(&piece.text).and_then(|ids| ids.pop());
         if let Some(id) = claimed {
             sqlx::query(
-                "UPDATE chunks SET seq = $2, char_start = $3, char_end = $4, doc_version = $5
+                "UPDATE chunks SET seq = $2, char_start = $3, char_end = $4, doc_version = $5,
+                        heading = $6
                  WHERE id = $1",
             )
             .bind(id)
@@ -1039,6 +1183,7 @@ pub async fn replace_chunks(
             .bind(piece.char_start)
             .bind(piece.char_end)
             .bind(version)
+            .bind(&piece.heading)
             .execute(&mut *tx)
             .await?;
             adopted.push(id);
@@ -1069,8 +1214,8 @@ pub async fn replace_chunks(
     for (id, piece) in to_insert {
         sqlx::query(
             "INSERT INTO chunks
-                (id, kb_id, document_id, seq, text, char_start, char_end, doc_version)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                (id, kb_id, document_id, seq, text, char_start, char_end, doc_version, heading)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
         )
         .bind(id)
         .bind(kb_id)
@@ -1080,6 +1225,7 @@ pub async fn replace_chunks(
         .bind(piece.char_start)
         .bind(piece.char_end)
         .bind(version)
+        .bind(&piece.heading)
         .execute(&mut *tx)
         .await?;
     }
@@ -1134,6 +1280,7 @@ pub async fn queue_extraction_one(pool: &PgPool, document_id: Uuid) -> AppResult
     .bind(document_id)
     .fetch_one(&mut *tx)
     .await?;
+    crate::jobs::notify_worker_tx(&mut tx).await?;
     tx.commit().await?;
     Ok(job_id)
 }
@@ -1178,6 +1325,22 @@ pub async fn chunks_for_extraction(
     Ok(rows)
 }
 
+/// 文件的**开头**：序号最小的现存分块，不论抽没抽过。
+///
+/// 不能拿 [`chunks_for_extraction`] 的第一条代替：那只是还没抽的第一块——改过的文件
+/// 重抽时第 7 块会拿到第 3 块，失败重试时后面的块会拿到失败的那块
+pub async fn opening_chunk(pool: &PgPool, document_id: Uuid) -> AppResult<Option<(Uuid, String)>> {
+    let row = sqlx::query_as(
+        "SELECT id, text FROM chunks
+         WHERE document_id = $1 AND superseded_at IS NULL
+         ORDER BY seq LIMIT 1",
+    )
+    .bind(document_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
 /// 推进抽取状态（顺带清空上一轮的失败原因——重跑即翻篇）。
 pub async fn set_graph_status(pool: &PgPool, id: Uuid, status: &str) -> AppResult<()> {
     sqlx::query(
@@ -1216,10 +1379,20 @@ pub async fn set_embeddings(pool: &PgPool, items: &[(Uuid, Vec<f32>)]) -> AppRes
             .await?;
     }
     tx.commit().await?;
+    // 第一次写下这个维度的向量，索引就该排上了（0035）。在了的话这一句是一次查找
+    if let Some((_, first)) = items.first() {
+        crate::vector_index::request(pool, crate::vector_index::Target::Chunks, first.len())
+            .await?;
+    }
     Ok(())
 }
 
-/// 向量近邻检索（余弦距离，顺扫；P1 规模足够）。
+/// 向量近邻检索（余弦距离）。维度写成字面量、两侧 cast、`relaxed_order`——三条
+/// 规矩见 `vector_index`；走不走索引由规划器定。
+///
+/// 次序在外层再排一遍（`vector_index::RESORT`）：`relaxed_order` 下索引给的次序
+/// 只是大致按距离，而距离并列时精确路径和 HNSW 各排各的——同一问两种计划回的
+/// 居首不同（#652）。并列由 id 定
 pub async fn vector_search(
     pool: &PgPool,
     kb_id: Uuid,
@@ -1227,21 +1400,34 @@ pub async fn vector_search(
     limit: i64,
     as_of: Option<DateTime<Utc>>,
 ) -> AppResult<Vec<Uuid>> {
+    let dims = embedding.len();
+    if dims == 0 {
+        return Ok(Vec::new());
+    }
     let query_vec = Vector::from(embedding.to_vec());
+    let mut tx = pool.begin().await?;
+    crate::vector_index::relaxed_order(pool, &mut tx).await?;
     let rows: Vec<(Uuid,)> = sqlx::query_as(&format!(
-        "SELECT id FROM chunks c
-         WHERE c.kb_id = $1 AND c.embedding IS NOT NULL AND {live}
-           AND vector_dims(c.embedding) = vector_dims($2)
-         ORDER BY c.embedding <=> $2
-         LIMIT $3",
+        "WITH nearest AS MATERIALIZED (
+             SELECT id, {distance} AS distance FROM chunks c
+             WHERE c.kb_id = $1 AND c.embedding IS NOT NULL AND {live}
+               AND {same_dims}
+             ORDER BY {distance}
+             LIMIT $3
+         )
+         SELECT id FROM nearest ORDER BY {resort}",
         live = crate::record_axis::chunk_live_at("c", 4),
+        same_dims = crate::vector_index::same_dims("c.embedding", dims),
+        distance = crate::vector_index::distance("c.embedding", 2, dims),
+        resort = crate::vector_index::RESORT,
     ))
     .bind(kb_id)
     .bind(&query_vec)
     .bind(limit)
     .bind(as_of)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
@@ -1307,11 +1493,16 @@ pub async fn queue_extraction(
     source_id: Option<Uuid>,
 ) -> AppResult<Vec<Uuid>> {
     let mut tx = pool.begin().await?;
+    // 来源说了不抽取的文档不排（`Source::extracts` 的 SQL 版，两处判的是同一个键）。
+    // 这条在库里挡而不是在各个入口挡：全库重建（`rebuild`）、按来源重抽、以后
+    // 任何新入口都走这里，schema 文档一律不进图（0035 决定 7，#553）
     let ids: Vec<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM documents
-         WHERE kb_id = $1 AND deleted_at IS NULL AND status = 'ready'
-           AND ($2::uuid IS NULL OR source_id = $2)
-         ORDER BY created_at",
+        "SELECT d.id FROM documents d
+         LEFT JOIN sources s ON s.id = d.source_id
+         WHERE d.kb_id = $1 AND d.deleted_at IS NULL AND d.status = 'ready'
+           AND ($2::uuid IS NULL OR d.source_id = $2)
+           AND NOT coalesce(s.config -> 'extract' = 'false'::jsonb, false)
+         ORDER BY d.created_at",
     )
     .bind(kb_id)
     .bind(source_id)
@@ -1354,6 +1545,7 @@ pub async fn queue_extraction(
     .bind(&ids)
     .execute(&mut *tx)
     .await?;
+    crate::jobs::notify_worker_tx(&mut tx).await?;
     tx.commit().await?;
     Ok(ids)
 }

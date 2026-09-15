@@ -1,9 +1,10 @@
-import { Button } from "../ui";
+import { Button, CARD_ACTIONS, Status } from "../ui";
 /* 等人点头的事实（docs/decisions/0015）。
    一句 remember 抽出的三元组先进待确认队列，不上图；人在这里点头它才进账本。
    **原句在上，三元组在下**：只列三元组等于要人凭空判断它对不对——
    实测里 `Acme --?--> 深圳` 那条，人一看原句就知道该拒。
    两处共用同一行组件：Review 页的「待确认」一档，与 Chat 里跟在 remember 步骤后面的那张卡。 */
+import { fmtObjectValue } from "../objectValue";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type PendingFactItem } from "../api";
 import { S } from "../i18n";
@@ -21,11 +22,7 @@ function sentence(quote: string): string {
 
 function objectText(f: PendingFactItem): string {
   if (f.object_name) return f.object_name;
-  const v = f.object_value;
-  if (!v) return "?";
-  if (v.summary) return v.summary;
-  const val = v.value === undefined || v.value === null ? "?" : String(v.value);
-  return v.unit ? `${val} ${v.unit}` : val;
+  return fmtObjectValue(f.object_value as Record<string, unknown> | null) ?? "?";
 }
 
 /** 点头是写图的动作，Editor 起步——与服务端 `require_kb(Role::Editor)` 同一口径。
@@ -80,12 +77,31 @@ export function PendingFactRow({
         <span className="text-body font-medium text-ink">{objectText(fact)}</span>
         {range && <span className="text-small text-ink-2">({range})</span>}
         {!fact.predicate_label && (
-          <span className="u-chip u-chip-warn ml-auto">{S.review.pendingNoPredicateChip}</span>
+          <Status tone="warn" className="ml-auto shrink-0">
+            {S.review.pendingNoPredicateChip}
+          </Status>
         )}
       </div>
-      <div className="mt-3 flex items-center gap-2">
+      {/* 与审阅页其余六种卡同一副页脚（CARD_ACTIONS）：动作在左，「谁说的」推到右边 */}
+      <div className={CARD_ACTIONS}>
+        {canDecide && (
+          <>
+            <Button variant="secondary" size="sm"
+              disabled={busy}
+              onClick={onConfirm}
+            >
+              {S.review.confirm}
+            </Button>
+            <Button variant="danger" size="sm"
+              disabled={busy}
+              onClick={onReject}
+            >
+              {S.review.reject}
+            </Button>
+          </>
+        )}
         {fact.proposed_by_name && (
-          <span className="text-fine text-ink-2">
+          <span className="ml-auto truncate text-fine text-ink-2">
             {fact.proposed_token_name
               ? S.review.pendingSaidVia(
                   fact.proposed_by_name,
@@ -93,22 +109,6 @@ export function PendingFactRow({
                 )
               : S.review.pendingSaidBy(fact.proposed_by_name)}
           </span>
-        )}
-        {canDecide && (
-          <div className="ml-auto flex gap-2">
-            <Button variant="danger" size="sm"
-              disabled={busy}
-              onClick={onReject}
-            >
-              {S.review.reject}
-            </Button>
-            <Button variant="secondary" size="sm"
-              disabled={busy}
-              onClick={onConfirm}
-            >
-              {S.review.confirm}
-            </Button>
-          </div>
         )}
       </div>
     </div>

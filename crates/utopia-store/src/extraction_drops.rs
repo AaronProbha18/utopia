@@ -22,6 +22,12 @@ pub mod reason {
     pub const ATTR_NO_VALUE: &str = "attr_no_value";
     /// 值不合 datatype，归一化失败
     pub const ATTR_DATATYPE: &str = "attr_datatype";
+    /// 模型在边上写了一个这条关系没声明过的属性 key（0037）
+    pub const QUALIFIER_UNKNOWN: &str = "qualifier_unknown";
+    /// 边上属性的值换不成它声明的 datatype
+    pub const QUALIFIER_DATATYPE: &str = "qualifier_datatype";
+    /// 同一条边再听到一次，属性值与已记的不一致——先记下，不覆盖
+    pub const QUALIFIER_CONFLICT: &str = "qualifier_conflict";
     /// 模型自报置信度低于阈值
     pub const LOW_CONFIDENCE: &str = "low_confidence";
     /// 关系事实缺宾语
@@ -42,6 +48,55 @@ pub mod reason {
     /// 守卫放行了、结构却像从句（限定词起头的长串、句中的关系词）。**只记不挡**：
     /// 实体照常落库，例句留下来——#193 要的是一份跨语料的标注集，再决定哪条升成硬规则
     pub const CLAUSE_SUSPECT: &str = "clause_suspect";
+    /// 主语是「跟 X 有关的一群人」而写成了 X（#578）："former OpenAI personnel" 不是
+    /// OpenAI。事实不落，例句是那个短语；这一类该由提示词的规则改写到有名字的一侧，
+    /// 这里只量它还错多少
+    pub const SUBJECT_SHORTENED: &str = "subject_shortened";
+    /// 主宾片段不在引文里（#582）：模型没照抄。事实照旧处理，只记下来
+    pub const SPAN_NOT_IN_QUOTE: &str = "span_not_in_quote";
+    /// 模型报的别名（或它的引文）不在这一块原文里（0041 决定 2）：不记这个名字。
+    /// 名字是召回的桥，一座凭空的桥会把两个不相干的实体接到一起
+    pub const NAME_NOT_IN_TEXT: &str = "name_not_in_text";
+    /// 模型报的别名，这次回复（或本文档前面几块）里已经是另一个实体的名字（0041 决定 2）：
+    /// 一个名字不会同时是两样东西的名字。「海探1项目」声明成了一个机构，就不是探测器的别名
+    pub const NAME_CLAIMED_BY_ANOTHER: &str = "name_claimed_by_another";
+    /// 主语片段是个描述，不是任何声明过的实体的名字：事实不落（#582，取代 #578 的词表）
+    pub const SUBJECT_DESCRIBED: &str = "subject_described";
+    /// 宾语片段是个描述：事实照落，宾语落成字面值（#582）
+    pub const OBJECT_DESCRIBED: &str = "object_described";
+    /// 片段点的是另一个声明过的实体：改绑到它（#582）
+    pub const SPAN_REBOUND: &str = "span_rebound";
+    /// 片段是所绑名字前面带了别的词（"entrepreneur Tasha McCauley" / "companies using
+    /// OpenAI"）：头衔还是另一件东西，机器分不开，绑定照旧，只记（#582）
+    pub const SPAN_PREFIXED: &str = "span_prefixed";
+    /// 片段里没有任何声明过的名字（"him" / "the company"）：模型消解了指代，无从核对，
+    /// 绑定照旧，只记（#582）
+    pub const SPAN_COREFERENCE: &str = "span_coreference";
+    /// 片段抄的是事实**另一侧**的名字（宾语片段写成了主语）：抄错了位置，不是绑错了
+    /// 实体。绑定照旧，只记（#582）
+    pub const SPAN_MISPLACED: &str = "span_misplaced";
+    /// 宾语既没在 entities 里声明、库里也没有叫这个名字的东西：事实照落，
+    /// 宾语落成字面值而不是节点（#559）。记下来是为了量：这一类里有多少
+    /// 本该是实体（模型漏报），有多少本来就是描述
+    pub const OBJECT_UNDECLARED: &str = "object_undeclared";
+    /// 以下都来自 `utopia_extract::normalize`：只看结构、不看词的形状检查
+    /// 值只有破折号（`—`）：表里的「无」，不落
+    pub const NO_VALUE: &str = "no_value";
+    /// 值后面有一截引文里没有的字：只留引文里有的那段。只记
+    pub const VALUE_TRIMMED: &str = "value_trimmed";
+    /// 没有宾语也没有值、只带边属性：属性落成主语上的值事实。只记
+    pub const QUALIFIERS_WITHOUT_OBJECT: &str = "qualifiers_without_object";
+    /// 宾语是契约格式的日期：数落成值、日期进有效期；没带数的把写出来的那段落成值。只记
+    pub const TIME_AS_OBJECT: &str = "time_as_object";
+    /// 主语是契约格式的日期：数是谁的回复里没说，不落
+    pub const TIME_AS_SUBJECT: &str = "time_as_subject";
+    /// 宾语名字包住另一个声明实体、同句已有指向本尊的边：可能是描述，也可能是另一个
+    /// 东西（每股收益包住了净利润）。只记，不删
+    pub const OBJECT_DESCRIBES_DECLARED: &str = "object_describes_declared";
+    /// 上面几条去掉事实后没人引用的声明：不建
+    pub const ORPHAN_DECLARATION: &str = "orphan_declaration";
+    /// 引文抄自提示词里附的文件开头、不在这一块：证据会挂错出处，不落
+    pub const QUOTE_FROM_OPENING: &str = "quote_from_opening";
 }
 
 pub async fn record(

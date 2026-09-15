@@ -3,6 +3,7 @@
 //! 消解灰区只入审核队列并触发独立的攒批裁决任务——LLM 裁决永不阻塞本任务。
 
 use crate::llm_util;
+use crate::ontology_index;
 use crate::predicate_match::PredicateIndex;
 use crate::state::AppState;
 use sqlx::PgPool;
@@ -133,6 +134,255 @@ fn reads_like_a_sentence(words: &[String], raw_last: Option<&str>) -> bool {
 /// 守卫的样本全部来自一份语料，换一份就漏——换规则之前先要一份**跨语料的标注集**。
 /// 命中只记 `clause_suspect`（例句进 `extraction_drops`），实体照常落库；攒够两份语料的
 /// 样本再决定哪条升成硬规则。返回的是信号名，作为记录的 detail
+/// 槽位片段核对的结论（#582）
+#[derive(Debug, PartialEq)]
+enum SpanVerdict {
+    /// 没给片段，或片段就是所绑的那个名字（同名、同词干、名字的一部分、名字后面接着
+    /// 大写的续词——"Anthropic PBC"）
+    Ok,
+    /// 片段不在引文里：模型没照抄。当没给处理，记一笔
+    NotInQuote,
+    /// 片段点的是另一个声明过的实体：改绑到它
+    Rebind(String),
+    /// 片段是围着某个名字的短语，那个名字在里面只是修饰语（后面还有词、或带所有格）：
+    /// 描述，不是实体
+    Described(String),
+    /// 片段是所绑名字前面带了别的词：头衔（"entrepreneur Tasha McCauley"）还是另一件
+    /// 东西（"companies using OpenAI"），机器分不开。绑定照旧，只记
+    Prefixed(String),
+    /// 片段里没有任何声明过的名字：模型消解了指代（"him"、"the company"）。绑定照旧，只记
+    Coreference(String),
+    /// 片段抄的是事实另一侧的名字（宾语片段写成了主语）：抄错了位置。绑定照旧，只记
+    Misplaced(String),
+}
+
+/// 模型报给 `bound` 的别名，是不是已经声明成了另一个实体的名字（0041）。
+///
+/// 结构判据，不认词：同一个名字不会同时是两样东西的名字。模型把「海探1项目」列成
+/// 一个机构，又把它报成探测器的别名——两个答案打架，别名那个不要
+fn name_claimed_elsewhere(name: &str, bound: Uuid, declared: &HashMap<String, Uuid>) -> bool {
+    let key = utopia_store::resolution::normalize_name(name).to_lowercase();
+    declared.get(&key).is_some_and(|id| *id != bound)
+}
+
+/// 片段在不在引文里：大小写、空白都不论
+fn span_in_quote(span: &str, quote: &str) -> bool {
+    let norm = |s: &str| {
+        s.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    };
+    let (s, q) = (norm(span), norm(quote));
+    !s.is_empty() && q.contains(&s)
+}
+
+/// 一个词：去掉两头标点和所有格后的小写形态，连同原样（看大小写用）
+#[derive(Debug, Clone)]
+struct Word<'a> {
+    clean: String,
+    raw: &'a str,
+}
+
+/// 片段拆成词：去两头标点、去所有格（"OpenAI's" → openai）、去开头的冠词
+fn span_words(s: &str) -> Vec<Word<'_>> {
+    let mut words: Vec<Word<'_>> = s
+        .split_whitespace()
+        .filter_map(|raw| {
+            let w = raw.trim_matches(|c: char| !c.is_alphanumeric());
+            let w = w
+                .strip_suffix("'s")
+                .or_else(|| w.strip_suffix("\u{2019}s"))
+                .unwrap_or(w);
+            (!w.is_empty()).then(|| Word {
+                clean: w.to_lowercase(),
+                raw,
+            })
+        })
+        .collect();
+    while words
+        .first()
+        .is_some_and(|w| matches!(w.clean.as_str(), "the" | "a" | "an"))
+    {
+        words.remove(0);
+    }
+    words
+}
+
+/// 一个词是不是专名的样子：首字符大写或数字（"PBC"、"LLC"、"LX"、"Global"）
+fn looks_proper(raw: &str) -> bool {
+    raw.chars()
+        .find(|c| c.is_alphanumeric())
+        .is_some_and(|c| c.is_uppercase() || c.is_numeric())
+}
+
+/// 词序列 needle 在 hay 里连续出现的位置
+fn find_words(hay: &[Word<'_>], needle: &[Word<'_>]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > hay.len() {
+        return None;
+    }
+    (0..=hay.len() - needle.len()).find(|&i| {
+        needle
+            .iter()
+            .zip(&hay[i..])
+            .all(|(n, h)| n.clean == h.clean)
+    })
+}
+
+/// 片段说的是不是这个名字：同名、同词干（Acme / Acme Corp.）、泛用后缀互推——
+/// 与消解召回同一套判据（`recall_keys`）；或者片段的词全在名字里（"Altman" 之于
+/// "Sam Altman"，"Anthropic" 之于 "Anthropic, PBC"）
+fn slot_matches(span: &str, name: &str) -> bool {
+    let keys = |s: &str| {
+        let clean = span_words(s)
+            .into_iter()
+            .map(|w| w.clean)
+            .collect::<Vec<_>>()
+            .join(" ");
+        utopia_store::resolution::recall_keys(&utopia_store::resolution::normalize_name(&clean))
+    };
+    let (a, b) = (keys(span), keys(name));
+    if !a.is_empty() && a.iter().any(|k| b.contains(k)) {
+        return true;
+    }
+    let (s, n) = (span_words(span), span_words(name));
+    !s.is_empty() && s.iter().all(|w| n.iter().any(|x| x.clean == w.clean))
+}
+
+/// **模型抄，机器判**（#582）。
+///
+/// #559、#578、#581 是同一件事的三张脸：模型把事实挂到了错的参与者身上——
+/// "former OpenAI personnel" 写成 OpenAI，"lawsuit against OpenAI" 造成节点。给每一种
+/// 形状写一条规则、配一张词表，量出来规则的服从率一半上下，词表只认见过的形状。
+/// 这里换一个问法：不问模型「这算不算实体」，让它把引文里点名每一侧的那几个字
+/// 抄出来（`subject_span` / `object_span`）。抄是模型稳定会做的事；判断交给机器：
+///
+/// 1. 片段是所绑的名字（同名、同词干、名字的一部分）→ 放行；
+/// 2. 片段是另一个声明过的实体的名字（或那名字的一部分）→ 改绑；
+/// 3. 片段里含所绑的名字、名字**后面**还有词（"former OpenAI personnel"、"The Verge
+///    reporter"）或名字带所有格（"Anthropic's safeguards"）→ 名字在里面只是修饰语，
+///    这是描述。后面的词全是专名的样子（"Anthropic PBC"、"OpenAI Global LLC"）不算；
+/// 4. 名字只在片段**末尾**、前面带了词 → 头衔还是另一件东西分不开，绑定照旧、只记；
+/// 5. 片段里是别的声明过的名字带着修饰 → 描述；一个名字都没有 → 指代，绑定照旧、只记。
+///
+/// 按语法位置来的补充：名字后面紧跟逗号是同位语（"Helen Toner, strategy director
+/// for …"），还是它；片段以这条事实**另一侧**的名字结尾（宾语片段抄成了主语），是抄错
+/// 位置，只记。
+///
+/// 同一套判据还用在模型**写的名字**和它 **ref 指的实体**之间（`written_verdict`）：写
+/// "OpenAI employees" 却 ref 到 OpenAI，是它自己的两个答案打架，v5 那轮的最后一条假边
+/// （"Eleven employees left OpenAI … to establish Anthropic" → Anthropic founded_by OpenAI）
+/// 就是这么来的——片段 "eleven employees" 里没有名字，只看片段拦不住。
+///
+/// 只有 3 和 5 前半改动事实（主语丢、宾语落字面值）；其余都是信号，让每一层的比率
+/// 按库、按模型读得出来
+fn verify_span(
+    span: Option<&str>,
+    name: &str,
+    other: &str,
+    quote: &str,
+    declared: &HashMap<String, Uuid>,
+) -> SpanVerdict {
+    let Some(span) = span.map(str::trim).filter(|s| !s.is_empty()) else {
+        return SpanVerdict::Ok;
+    };
+    if !span_in_quote(span, quote) {
+        return SpanVerdict::NotInQuote;
+    }
+    if slot_matches(span, name) {
+        return SpanVerdict::Ok;
+    }
+    let s = span_words(span);
+    let n = span_words(name);
+    if s.is_empty() {
+        return SpanVerdict::Coreference(span.to_string());
+    }
+
+    // 2. 另一个声明过的实体：精确/词干命中优先，其次名字包住片段的（取最短的那个）
+    let mut others: Vec<&String> = declared.keys().filter(|k| k.as_str() != name).collect();
+    others.sort();
+    if let Some(k) = others.iter().find(|k| {
+        let keys = |x: &str| {
+            let clean = span_words(x)
+                .into_iter()
+                .map(|w| w.clean)
+                .collect::<Vec<_>>()
+                .join(" ");
+            utopia_store::resolution::recall_keys(&utopia_store::resolution::normalize_name(&clean))
+        };
+        let (a, b) = (keys(span), keys(k));
+        a.iter().any(|x| b.contains(x))
+    }) {
+        return SpanVerdict::Rebind((*k).clone());
+    }
+    // 单个词包在别的名字里不算改绑："company" 是指代，句首的 "Stockholders" 大写也
+    // 不是专名的证据（召回测量台第二轮：主语从 NVIDIA 改绑到了「年度股东大会」）。
+    // 单个词只认精确/词干命中（上面 `slot_matches` 那一关）
+    let names_something = s.len() >= 2;
+    let mut supersets: Vec<(&String, usize)> = others
+        .iter()
+        .filter_map(|k| {
+            let kw = span_words(k);
+            (names_something && s.iter().all(|w| kw.iter().any(|x| x.clean == w.clean)))
+                .then_some((*k, kw.len()))
+        })
+        .collect();
+    supersets.sort_by_key(|(_, len)| *len);
+    if let Some((k, _)) = supersets.first() {
+        return SpanVerdict::Rebind((*k).clone());
+    }
+    // 所绑的名字在片段里的位置；名字后面紧跟逗号是同位语（"TBPN, a media company in
+    // California"），还是它——先于下面所有判断
+    let found = find_words(&s, &n);
+    if let Some(i) = found {
+        let end = i + n.len();
+        if end < s.len() && s[end - 1].raw.trim_end().ends_with(',') {
+            return SpanVerdict::Ok;
+        }
+    }
+
+    // 片段以事实另一侧的名字结尾：抄错了位置（宾语片段写成了主语），不是绑错了实体。
+    // 「片段以别的声明名结尾就改绑到它」试过两轮（v4/v5）：介词的补语、名单的最后一项、
+    // 并列的后一个（"Swisher and … Alex Heath"）都会被当成头，错的多过对的，不做
+    let ends_with = |k: &str| {
+        let kw = span_words(k);
+        !kw.is_empty() && kw.len() < s.len() && find_words(&s[s.len() - kw.len()..], &kw) == Some(0)
+    };
+    if !other.is_empty() && !slot_matches(name, other) && ends_with(other) {
+        return SpanVerdict::Misplaced(span.to_string());
+    }
+
+    // 3 / 4. 所绑的名字在片段里
+    if let Some(i) = found {
+        let end = i + n.len();
+        let last = s[end - 1].raw;
+        let possessive = last.ends_with("'s") || last.ends_with("\u{2019}s");
+        let after = &s[end..];
+        // 名字后面接着 and / & 再接专名，是并列（"SB Energy and SoftBank"）：名字是名单里
+        // 的一项，不是修饰语。连词跟冠词一样是语法词，不是词表
+        let after = match after.first() {
+            Some(w) if matches!(w.clean.as_str(), "and" | "&") => &after[1..],
+            _ => after,
+        };
+        if possessive || after.iter().any(|w| !looks_proper(w.raw)) {
+            return SpanVerdict::Described(span.to_string());
+        }
+        if after.is_empty() && i > 0 {
+            return SpanVerdict::Prefixed(span.to_string());
+        }
+        return SpanVerdict::Ok;
+    }
+
+    // 5. 别的名字带着修饰，或一个名字都没有
+    if others.iter().any(|k| {
+        let kw = span_words(k);
+        find_words(&s, &kw).is_some()
+    }) {
+        return SpanVerdict::Described(span.to_string());
+    }
+    SpanVerdict::Coreference(span.to_string())
+}
+
 fn clause_suspect(name: &str) -> Option<&'static str> {
     let words: Vec<String> = name
         .split_whitespace()
@@ -192,6 +442,21 @@ fn is_entity_name(name: &str) -> bool {
         && !words[0].is_empty()
         && words[0].chars().all(|c| c.is_ascii_digit())
     {
+        return false;
+    }
+    /* **整体就是一个量的，不是一个东西**：`$5 billion`、`52%`、`3.5 million`。
+    上面那条部分格只接住 `745 of …`，接不住这些。
+
+    这道闸装在**这里**才管用。抽取那边也有一道（`looks_literal`），但它前面
+    挂着 `!known_predicate`：谓词一旦是本体里列出来的关系，整段判断直接跳过。
+    实测就是这么漏的——`hasAmount` 来自 FIBO 包、抽取前就在本体里，于是
+    `Microsoft hasAmount $1 billion` 里那个数额照样被造成了节点，
+    而同一个库里 `invested`（语料自己长的、当时还未知）走到了那道闸、被拦下。
+    `is_entity_name` 不问谓词，主语宾语一视同仁，两条路都过它。
+
+    判据仍旧从严（见 `parse_quantity`）：尾巴上有实词就不算，
+    `3M`、`7-Eleven`、`23andMe`、`2025 Atlantic hurricane season` 一个都不误伤。 */
+    if utopia_extract::parse_quantity(name).is_some() {
         return false;
     }
     true
@@ -414,6 +679,38 @@ struct BoundEntity {
     type_id: Option<Uuid>,
 }
 
+/// 模型写的名字和它 ref 指的实体对不对得上（#582）。没有 ref、或写的就是那个名字时
+/// 无事；否则把写的名字当片段核对，写的名字自己当引文（免掉在不在引文那一关）。
+/// 只有描述和改绑两种结论会用到，其余当无事
+fn written_verdict(
+    written: &str,
+    bound: &str,
+    other: &str,
+    referenced: bool,
+    declared: &HashMap<String, Uuid>,
+) -> SpanVerdict {
+    if !referenced || slot_matches(written, bound) {
+        return SpanVerdict::Ok;
+    }
+    match verify_span(Some(written), bound, other, written, declared) {
+        v @ (SpanVerdict::Described(_) | SpanVerdict::Rebind(_)) => v,
+        _ => SpanVerdict::Ok,
+    }
+}
+
+/// 一侧绑上的名字：有 ref 就是 ref 指的那个实体声明的名字，没有就是模型写的（#582）
+fn bound_name<'a>(
+    ref_names: &'a HashMap<String, String>,
+    reference: Option<&str>,
+    written: &'a str,
+) -> &'a str {
+    reference
+        .map(str::trim)
+        .and_then(|h| ref_names.get(h))
+        .map(String::as_str)
+        .unwrap_or(written)
+}
+
 fn referenced_entity(
     ref_entities: &HashMap<String, BoundEntity>,
     reference: &str,
@@ -583,6 +880,30 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
         tracing::info!(document = %document_id, "skipping a deleted document");
         return Ok(());
     }
+    // **本体向量门控（#526）——把等待从 worker 里搬回队列。**
+    //
+    // 在这之前 `extraction::run` 直接调 `ontology_index::refresh` 等到补齐才动。
+    // 那次等待有三个坏处：它把 worker 槽占住，让同一批次的其余文档和别的库的
+    // 任务全卡在锁上；它让文档在这段时间里挂着 `extracting`，用户看见 32 篇
+    // 全在「抽取中」却没一个事实落库；它用一份可能没补齐的索引作依据，抽出来
+    // 的图是基于半个本体写的，再也不会被重抽。
+    //
+    // 换成队列内门控：本体超出提示词预算且需要嵌入时，先把 `embed_ontology`
+    // 排上、把这次抽取挂回 `queued` 等 30s，让 worker 槽立刻空出来——同一批
+    // 其余文档和其它库的任务都能继续认领。下次轮到这个文档时本体可能已就绪，
+    // 也可能还没，那就再等一轮。**不是同一个文档在等，是同一个抽取器在等**，
+    // 而等候归队列管，attempts 不烧。
+    //
+    // 没配嵌入模型的库不等，照旧送完整本体——那种部署本来就没有检索。
+    // 等也有期限（`jobs::DEFER_WINDOW_SECS`），补齐任务一直失败时这篇按失败处理。
+    if ontology_index::gate_required(state, doc.kb_id).await? {
+        // gate_required 已经把 `embed_ontology` 入队过了（如果应该入队的话）。
+        // 这里只挂等待时长，不重复 enqueue。attempts 会被 mark_failed 退回去——
+        // 同一个等待条件两次排队不应该消耗两次预算。
+        let err = anyhow::Error::msg("waiting for ontology index to be embedded")
+            .context(utopia_core::Deferred::new(Duration::from_secs(30)));
+        return Err(err);
+    }
     let kb = utopia_store::kbs::get(&state.pool, doc.kb_id).await?;
     let settings = utopia_store::settings::get(&state.pool, kb.workspace_id)
         .await?
@@ -597,7 +918,9 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
     let etypes = utopia_store::graph::entity_types(&state.pool, doc.kb_id).await?;
     // 这一轮落过的事实（新建或重复观察）：结尾对它们跑一遍签名检查
     let mut touched_facts: Vec<Uuid> = Vec::new();
-    let rtypes = utopia_store::graph::relation_types(&state.pool, doc.kb_id).await?;
+    let mut rtypes = utopia_store::graph::relation_types(&state.pool, doc.kb_id).await?;
+    // 名字属性不进给模型的清单（0041）：名字走回复里的 `names`，服务端核对它在原文里
+    rtypes.retain(|r| !utopia_store::names::is_name_attribute(r));
     // 关系与属性分道：属性走字面值通道，不进关系清单。
     //
     // **本体里没有对应关系时就没有谓词**（见 `facts.predicate_id`）。原词落进
@@ -619,6 +942,29 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
         .iter()
         .filter(|r| r.kind == "attribute")
         .map(|r| (r.key.as_str(), r))
+        .collect();
+    /* **边上的属性**（0037）：一条关系声明过的属性定义，按关系 id 取。
+    属性定义就是 kind='attribute' 的行，datatype / unit / 换算全复用；
+    写入时按这里的 key 对模型给的 qualifiers，对不上的进丢弃表让人看见 */
+    let rtype_by_id: HashMap<Uuid, &utopia_core::models::RelationType> =
+        rtypes.iter().map(|r| (r.id, r)).collect();
+    let attr_by_key: HashMap<String, &utopia_core::models::RelationType> = rtypes
+        .iter()
+        .filter(|r| r.kind == "attribute")
+        .map(|r| (r.key.to_lowercase(), r))
+        .collect();
+    let mut qualifier_defs: HashMap<Uuid, Vec<&utopia_core::models::RelationType>> = rtypes
+        .iter()
+        .filter(|r| r.kind != "attribute" && !r.qualifiers.is_empty())
+        .map(|r| {
+            let defs = r
+                .qualifiers
+                .iter()
+                .filter_map(|q| rtype_by_id.get(q).copied())
+                .filter(|q| q.kind == "attribute")
+                .collect();
+            (r.id, defs)
+        })
         .collect();
     let type_ids: HashMap<&str, Uuid> = etypes.iter().map(|t| (t.key.as_str(), t.id)).collect();
     let rel_ids: HashMap<&str, Uuid> = rtypes.iter().map(|r| (r.key.as_str(), r.id)).collect();
@@ -662,6 +1008,13 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
             classes = etypes.len(),
             "本体超出提示词预算，改为按分块检索候选"
         );
+        // 走到这里说明本体超出预算且按预算逻辑需要按块检索——但本任务的等待
+        // 早就在 `gate_required` 里完成（要么已经嵌好，要么通过 `Deferred` 挂回
+        // 队列）。剩下的就是按块检索本身，不再有「顺便 refresh」这一步：
+        // 那一步是在 worker 里等 PER_KB 锁，正是 #526 想消除的副作用。
+        //
+        // 留一个注释方便日后回看：若 budget 在 `gate_required` 与此处之间被改小，
+        // 本文档会按全量本体抽——比 #526 之前的「等几分钟」更接近「对的那一边」。
     }
     // 内置类恒在：检索漏掉的分块仍要有地方落脚，否则模型无类可选
     let seed_classes: HashSet<Uuid> = etypes.iter().filter(|t| t.builtin).map(|t| t.id).collect();
@@ -701,6 +1054,13 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
 
     let doc_time = doc.doc_time.map(|t| t.format("%Y-%m-%d").to_string());
     let chunks = utopia_store::documents::chunks_for_extraction(&state.pool, document_id).await?;
+    // 文件开头：序号最小的现存分块（不是还没抽的第一块）。备忘文件一个片段一块，
+    // 前一段不是后一段的开头，不附
+    let opening_chunk = if await_nod {
+        None
+    } else {
+        utopia_store::documents::opening_chunk(&state.pool, document_id).await?
+    };
 
     let mut doc_cache: HashMap<(Option<Uuid>, String), Uuid> = HashMap::new();
     // Identities introduced through handles, grouped only for detecting document-local
@@ -737,9 +1097,11 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
         // 提示词大是慢，没有类可选是抽不出东西
         let lists = if retrieve_per_chunk {
             match ctx {
-                Some(v) => chunk_lists(state, doc.kb_id, v, &etypes, &rtypes, &seed_classes)
-                    .await
-                    .unwrap_or(None),
+                Some(v) => {
+                    chunk_lists(state, doc.kb_id, v, &etypes, &rtypes, &seed_classes, budget)
+                        .await
+                        .unwrap_or(None)
+                }
                 None => None,
             }
         } else {
@@ -755,13 +1117,19 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
                 name: name.clone(),
             })
             .collect();
-        let messages = utopia_extract::build_messages(
+        // 这一块就是开头本身时不再重复一遍
+        let opening = opening_chunk
+            .as_ref()
+            .filter(|(id, _)| *id != chunk.id)
+            .map(|(_, text)| text.as_str());
+        let messages = utopia_extract::build_messages_with_opening(
             &lists.types,
             &lists.relations,
             &lists.attributes,
             doc_time.as_deref(),
             &doc.filename,
             &known,
+            opening,
             &chunk.text,
         );
         // 这两处 continue 跳过的是**整个分块**——它一条事实都没产出。
@@ -774,7 +1142,9 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
                 continue;
             }
         };
-        let extraction = match utopia_extract::parse_response(&reply) {
+        // 模型的原话只在 debug 级别看得到：查它对哪几个字段怎么填（#582 的片段）时开
+        tracing::debug!(%document_id, seq = chunk.seq, reply = %reply, "抽取原始回复");
+        let mut extraction = match utopia_extract::parse_response(&reply) {
             Ok(x) => x,
             Err(e) => {
                 tracing::warn!(%document_id, seq = chunk.seq, error = %e, "抽取结果解析失败，跳过该分块");
@@ -819,6 +1189,71 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
         }
 
         // 实体消解：名称 → 实体 id（本分块的事实按原文名字连线）
+        // **落库前先查形状**（utopia_extract::normalize）：只看结构、不看词——引文里有没有
+        // 这段字、值是不是只有标点、一侧是不是契约的日期、同句有没有另一条边。读懂时间
+        // 归模型（提示词 3c），这里只核对它照没照契约写，做了什么都记进丢弃表
+        let from_opening = match opening {
+            Some(text) => {
+                utopia_extract::drop_quotes_from_opening(&mut extraction, &chunk.text, text)
+            }
+            None => Vec::new(),
+        };
+        for n in from_opening
+            .into_iter()
+            .chain(utopia_extract::normalize_facts(&mut extraction))
+        {
+            use utopia_extract::Normalization as N;
+            use utopia_store::extraction_drops::reason;
+            let (r, detail, example) = match n {
+                N::NoValue { predicate, written } => (reason::NO_VALUE, predicate, written),
+                N::ValueTrimmed {
+                    predicate,
+                    kept,
+                    dropped,
+                } => (
+                    reason::VALUE_TRIMMED,
+                    predicate,
+                    format!("{kept} ✂ {dropped}"),
+                ),
+                N::QualifiersWithoutObject { predicate, values } => (
+                    reason::QUALIFIERS_WITHOUT_OBJECT,
+                    predicate,
+                    format!("{values} value(s) moved onto the subject"),
+                ),
+                N::TimeAsObject {
+                    predicate,
+                    written,
+                    values,
+                } => (
+                    reason::TIME_AS_OBJECT,
+                    predicate,
+                    if values == 0 {
+                        format!("{written} kept as a value")
+                    } else {
+                        format!("{written} → {values} value(s)")
+                    },
+                ),
+                N::TimeAsSubject { predicate, written } => {
+                    (reason::TIME_AS_SUBJECT, predicate, written)
+                }
+                N::ObjectDescribesDeclared {
+                    predicate,
+                    name,
+                    head,
+                } => (
+                    reason::OBJECT_DESCRIBES_DECLARED,
+                    predicate,
+                    format!("{name} ← {head}"),
+                ),
+                N::OrphanDeclaration { name } => {
+                    (reason::ORPHAN_DECLARATION, "entity".to_string(), name)
+                }
+                N::QuoteFromOpening { predicate, quote } => {
+                    (reason::QUOTE_FROM_OPENING, predicate, quote)
+                }
+            };
+            drop_signal(state, doc.kb_id, document_id, r, &detail, Some(&example)).await;
+        }
         let mut entity_ids: HashMap<String, Uuid> = HashMap::new();
         // 名称 → 声明类型（属性 domain 校验用：salary 不能挂在 Organization 上）
         let mut entity_type_of: HashMap<String, Option<Uuid>> = HashMap::new();
@@ -834,6 +1269,14 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
                     },
                 )
             })
+            .collect();
+        // 句柄 → 声明的名字：片段核对要对着**绑上的**那个名字看（#582）。模型写
+        // "OpenAI personnel" 却 ref 到 e1=OpenAI 时，错在 ref 上，片段对着 "OpenAI"
+        // 才看得出来
+        let mut ref_names: HashMap<String, String> = doc_entities
+            .iter()
+            .enumerate()
+            .map(|(index, (_, _, name))| (format!("k{}", index + 1), name.clone()))
             .collect();
         let mut response_claims: HashMap<String, Vec<Uuid>> = HashMap::new();
 
@@ -929,6 +1372,7 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
                 )
                 .await?;
                 ref_entities.insert(handle.to_string(), BoundEntity { id, type_id });
+                ref_names.insert(handle.to_string(), name.to_string());
                 id
             } else {
                 resolve_bare(
@@ -948,6 +1392,24 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
             };
             if let Some(p) = proposed {
                 let _ = utopia_store::resolution::set_proposed_type(&state.pool, id, p).await;
+            }
+            // 模型写下的这个名字就在这一块原文里时，给这条名字事实补出处（0041）。
+            // 给已知句柄时它照提示词写的是清单上的全称，这一块里未必有——那就不补，
+            // 这一块用的别的写法走下面的 `names`。
+            // 记忆日志里的不补：那一句算不算出处，要等人点头（0018）
+            if !await_nod && span_in_quote(name, &chunk.text) {
+                let _ = utopia_store::names::record(
+                    &state.pool,
+                    doc.kb_id,
+                    id,
+                    name,
+                    Some(utopia_store::names::NameSource {
+                        chunk_id: chunk.id,
+                        quote: name,
+                    }),
+                    doc.doc_time,
+                )
+                .await;
             }
             // 模型自己的说法。**跟 proposed_type 分开存**：那一列的含义是
             // "本体里没有"，增长回路靠它的稀有性设门槛；这一列每个实体都有。
@@ -981,6 +1443,133 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
             entity_type_of.insert(name.to_string(), type_id);
         }
 
+        // 实体的别的名字（0041 决定 2）。**名字与引文都要在这一块原文里**：名字是召回的桥，
+        // 一座凭空造的桥会把两个不相干的实体接到一起。认不认「简称」「又名」是模型的事，
+        // 服务端不认词，只核对它抄的字是不是真在原文里
+        // 这次回复声明的名字，加上本文档前面几块认下的：别名撞上它们之一就不收
+        let declared_names: HashMap<String, Uuid> = entity_ids
+            .iter()
+            .map(|(name, id)| (name.as_str(), *id))
+            .chain(
+                doc_entities
+                    .iter()
+                    .map(|(id, _, name)| (name.as_str(), *id)),
+            )
+            .map(|(name, id)| {
+                (
+                    utopia_store::resolution::normalize_name(name).to_lowercase(),
+                    id,
+                )
+            })
+            .collect();
+        for n in &extraction.names {
+            let name = n.name.trim();
+            let Some(bound) = ref_entities.get(n.entity_ref.trim()) else {
+                drop_signal(
+                    state,
+                    doc.kb_id,
+                    document_id,
+                    utopia_store::extraction_drops::reason::MALFORMED_ITEM,
+                    "name ref is not a declared handle",
+                    Some(name),
+                )
+                .await;
+                continue;
+            };
+            let quote = n
+                .quote
+                .as_deref()
+                .map(str::trim)
+                .filter(|q| !q.is_empty())
+                .unwrap_or(name);
+            if name_claimed_elsewhere(name, bound.id, &declared_names) {
+                drop_signal(
+                    state,
+                    doc.kb_id,
+                    document_id,
+                    utopia_store::extraction_drops::reason::NAME_CLAIMED_BY_ANOTHER,
+                    &n.entity_ref,
+                    Some(name),
+                )
+                .await;
+                continue;
+            }
+            if !is_entity_name(name)
+                || !span_in_quote(name, quote)
+                || !span_in_quote(quote, &chunk.text)
+            {
+                drop_signal(
+                    state,
+                    doc.kb_id,
+                    document_id,
+                    utopia_store::extraction_drops::reason::NAME_NOT_IN_TEXT,
+                    &n.entity_ref,
+                    Some(name),
+                )
+                .await;
+                continue;
+            }
+            // 记忆日志读到的名字与它的其它事实一样等人点头（0018）：名字是召回的桥，
+            // 一句没确认过的话不该先把桥搭上。点头之后是一条普通的名字事实；
+            // 这一步不配对，同名的配对等下一次在文档里读到它
+            if await_nod {
+                let known_as = utopia_store::names::ensure_known_as(&state.pool, doc.kb_id).await?;
+                let value = serde_json::json!({
+                    "value": utopia_store::resolution::normalize_name(name)
+                });
+                if let utopia_store::pending::Outcome::Proposed(_) = utopia_store::pending::propose(
+                    &state.pool,
+                    utopia_store::pending::Proposal {
+                        kb_id: doc.kb_id,
+                        subject_id: bound.id,
+                        predicate_id: Some(known_as),
+                        object_id: None,
+                        object_value: Some(&value),
+                        proposed_predicate: Some(utopia_store::names::KNOWN_AS),
+                        validity: utopia_store::graph::Validity {
+                            attested_at: doc.doc_time,
+                            ..Default::default()
+                        },
+                        confidence: 1.0,
+                        chunk_id: chunk.id,
+                        proposed_by: proposer.user_id,
+                        proposed_token: proposer.token_id,
+                    },
+                )
+                .await?
+                {
+                    pending_count += 1;
+                }
+                continue;
+            }
+            utopia_store::names::record(
+                &state.pool,
+                doc.kb_id,
+                bound.id,
+                name,
+                Some(utopia_store::names::NameSource {
+                    chunk_id: chunk.id,
+                    quote,
+                }),
+                doc.doc_time,
+            )
+            .await?;
+            // 别的实体已经叫这个名字：送去裁决，不合并
+            if utopia_store::names::pair_shared_name(&state.pool, doc.kb_id, bound.id, name).await?
+                > 0
+            {
+                needs_adjudication = true;
+            }
+        }
+
+        // 改绑的候选：这次回复声明的实体，加上提示词里给过的库内实体（#582）
+        let span_declared: HashMap<String, Uuid> = {
+            let mut m = entity_ids.clone();
+            for (id, _, name) in &doc_entities {
+                m.entry(name.clone()).or_insert(*id);
+            }
+            m
+        };
         for f in &extraction.facts {
             let confidence = f.confidence.unwrap_or(0.7).clamp(0.0, 1.0);
             if confidence < MIN_CONFIDENCE {
@@ -996,30 +1585,8 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
                 .await;
                 continue;
             }
-            let from = f.valid_from.as_deref().and_then(utopia_extract::parse_time);
-            let to = f.valid_to.as_deref().and_then(utopia_extract::parse_time);
-            // **两端各记各的粒度**（见 `facts.valid_to_precision`）。从前一个精度列描述两个端点，
-            // 于是「2020 年开始、2023-05-06 结束」这种只能共用一个值。
-            //
-            // 模型给的 valid_to = "unknown" 表示**原文说它结束了、但没说哪天**。
-            // parse_time 解不出它（本来就不是日期），落在这里显式认掉——
-            // 不认的话它退化成 None，那条事实就又变回"仍在持续"了
-            let ended_unknown = f
-                .valid_to
-                .as_deref()
-                .map(str::trim)
-                .is_some_and(|v| v.eq_ignore_ascii_case(utopia_store::graph::ENDED_UNKNOWN));
-            let validity = utopia_store::graph::Validity {
-                from: from.map(|(t, _)| t),
-                from_precision: from.map(|(_, p)| p),
-                to: to.map(|(t, _)| t),
-                to_precision: to
-                    .map(|(_, p)| p)
-                    .or(ended_unknown.then_some(utopia_store::graph::ENDED_UNKNOWN)),
-                // 这次观察出自哪一天的文档（0022）：没起点的事实从它起成立，结束了
-                // 不知哪天的到它为止。没有文档日期就是记下的此刻——账本能给的最好的
-                attested_at: doc.doc_time,
-            };
+            let validity =
+                validity_of(f.valid_from.as_deref(), f.valid_to.as_deref(), doc.doc_time);
 
             // 属性事实：谓词命中属性 → 字面值通道。datatype 校验失败宁缺勿脏；
             // domain 校验（含子类上溯）挡住"把 salary 挂到 Organization"这类张冠李戴。
@@ -1139,7 +1706,11 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
                     }
                 };
                 let datatype = attr.datatype.as_deref().unwrap_or("text");
-                let Some(normalized) = utopia_extract::normalize_attr_value(datatype, &raw) else {
+                // 只相对一件事给出的日期（「触发日后 45 天」，#681 §4）照原文收下、带着标记：
+                // 它是新的状态值，时态引擎照常用它接替前一个截止日
+                let Some(mut object_value) =
+                    utopia_extract::attr_object_value(datatype, &raw, f.relative)
+                else {
                     tracing::debug!(%document_id, attr = attr.key, ?raw, "属性值不合 datatype，跳过");
                     drop_signal(
                         state,
@@ -1152,9 +1723,10 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
                     .await;
                     continue;
                 };
-                let mut object_value = serde_json::json!({ "value": normalized });
-                if let Some(u) = attr.unit.as_deref().filter(|u| !u.is_empty()) {
-                    // 单位随事实落笔：类型上的单位以后改了，旧值仍按记录时的单位读
+                // 单位随事实落笔：类型上的单位以后改了，旧值仍按记录时的单位读。
+                // 记哪个单位照 `unit_for`——从前这里无条件盖上声明的单位，实测
+                //「提供 500 兆瓦的风电」被模型记成金额，再盖上 ¥ 就成了 500 块钱
+                if let Some(u) = unit_for(&raw, datatype, None, attr.unit.as_deref()) {
                     object_value["unit"] = serde_json::json!(u);
                 }
                 if await_nod {
@@ -1202,11 +1774,11 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
                     Some(f.predicate.as_str()),
                 )
                 .await?;
-                if !created {
-                    continue;
+                if created {
+                    fact_count += 1;
                 }
-                fact_count += 1;
-                // 单值属性 = functional：新值闭合旧值（属性历史由此而来）
+                // 单值属性 = functional：新值闭合旧值（属性历史由此而来）。并进已有断言的也对：
+                // 这份证据的日期可能更早，时间线的形状跟着变（#679）
                 if attr.functional && attr.temporal == "state" {
                     let report = utopia_store::temporal::reconcile_new_fact(
                         &state.pool,
@@ -1239,46 +1811,145 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
             // 原词进 proposed_predicate，消解那一遍只需换谓词，形状已经是对的。
             //
             // object 里的东西算不算字面值，判据从严：**模型没把它声明成实体**，
-            // 且**它本身解得出数字或日期**。"杭州"两条都不满足，"2015"都满足。
+            // 且**它整体就是一个量或一个日期**。"杭州"两条都不满足，"2015"、
+            // "$5 billion"、"52%" 都满足；"900 million weekly active users"
+            // 不满足——尾巴上还有实词，它说的就不再只是那个数了。
             // 文本值的属性（schema.org 里 323 个）在这一档仍会变成实体——
             // 那里没有可靠判据，猜错会吃掉真实体，不猜
-            let literal = match (&f.value, f.object.as_deref().map(str::trim)) {
-                (Some(v), None | Some("")) if !known_predicate(f.predicate.as_str()) => {
-                    Some(v.clone())
-                }
-                (_, Some(o))
-                    if !o.is_empty()
-                        && !known_predicate(f.predicate.as_str())
-                        && !entity_ids.contains_key(o)
-                        && looks_literal(o) =>
-                {
-                    Some(serde_json::Value::String(o.to_string()))
-                }
-                _ => None,
-            };
-            if let Some(value) = literal {
+            // 第二格是表层谓词：通常就是模型写的谓词；值旁边挂着一个没声明的宾语短语时，
+            // 短语并进来（见下面那一档）
+            let literal: Option<(serde_json::Value, String)> =
+                match (&f.value, f.object.as_deref().map(str::trim)) {
+                    // **给了值、没给宾语——不管这个谓词本体认不认识。**
+                    //
+                    // 从前这里卡着 `!known_predicate`：`job_title` 在 schema.org 里是关系
+                    //（它的 range 是 `Text|DefinedTerm`，含一个类就走关系通道），于是模型
+                    // 写 `job_title` + "founder and CEO" 时既进不了属性档、又在关系档因为
+                    // 缺宾语被丢掉——`object_missing` 实测 69 次，四篇文档里每个人的职务
+                    // 就是这么没的。谓词认不认识与「这条事实带的是值还是实体」无关：
+                    // 值在手上就收下，原词进 proposed_predicate，等本体采纳时再换谓词，
+                    // 形状已经是对的（0010）
+                    (Some(v), None | Some("")) => Some((v.clone(), f.predicate.clone())),
+                    /* **宾语整体是一个量：一律当值收下**，不问谓词认不认识、
+                    也不问模型有没有把它声明成实体。
+
+                    下面那一档卡着 `!known_predicate`，理由是本体说得上话的时候
+                    别去二猜模型。可量值这里没有可猜的余地：一个数额不会因为
+                    谓词恰好在本体里就变成一个东西。实测漏的正是这一格——
+                    `hasAmount` 来自 FIBO 包、抽取前就在本体里，
+                    `Microsoft hasAmount $1 billion` 于是绕过下面那一档，
+                    把数额造成了节点；同一个库里 `invested` 当时还未知，
+                    走到下面那一档、被拦住了。同一个数额，两种下场。
+
+                    收下而不是丢掉：`is_entity_name` 那道闸现在也拦纯量值，
+                    不在这里接住的话，这条事实会连同那个数一起进丢弃表。
+                    原词照旧进 `proposed_predicate`，采纳时再换谓词 */
+                    (_, Some(o)) if utopia_extract::parse_quantity(o).is_some() => Some((
+                        serde_json::Value::String(o.to_string()),
+                        f.predicate.clone(),
+                    )),
+                    /* **给了值、宾语却是一个没声明的短语：值收下，短语并进表层谓词**（#685）。
+
+                    `build` + 宾语「new energy generation」+ 值「at least 10 GW」：宾语不是
+                    回复里声明的实体、没有句柄、也不是本文档认下的名字，于是上面几档都接
+                    不住，关系那条路又因为它不是实体把整条丢掉——那个数跟着没了。模型把
+                    同一句话写成纯值（「at least 10 GW of new energy generation」）时就落得
+                    下，落不落全看它挑了两种同样说得通的写法里的哪一种。
+
+                    只看结构：值在、宾语没有句柄、宾语不在已声明的名字里。宾语是个认得的
+                    实体时照旧走边。短语不丢，进表层谓词（`build new energy generation`），
+                    采纳时再换谓词；原句在证据里 */
+                    (Some(v), Some(o))
+                        if undeclared_beside_value(f.object_ref.as_deref(), o, &span_declared) =>
+                    {
+                        Some((v.clone(), format!("{} {o}", f.predicate.trim())))
+                    }
+                    (_, Some(o))
+                        if !o.is_empty()
+                            && !known_predicate(f.predicate.as_str())
+                            && !entity_ids.contains_key(o)
+                            && looks_literal(o) =>
+                    {
+                        Some((
+                            serde_json::Value::String(o.to_string()),
+                            f.predicate.clone(),
+                        ))
+                    }
+                    _ => None,
+                };
+            if let Some((value, surface)) = literal {
                 let subject_name = f.subject.trim();
-                let Some(&subject_id) = entity_ids.get(subject_name) else {
-                    drop_signal(
-                        state,
-                        doc.kb_id,
-                        document_id,
-                        utopia_store::extraction_drops::reason::SUBJECT_NOT_DECLARED,
-                        &f.predicate,
-                        Some(subject_name),
-                    )
-                    .await;
-                    continue;
+                // **主语按关系那条路解，不要求它在本次回复里重新声明过。**
+                //
+                // 从前这里只查 `entity_ids`，模型用「已知实体」句柄带进来的、
+                // 或者只写了名字没重列的主语一律落空——实测一轮 51 块里
+                // `subject_not_declared` 丢掉 113 条，丢的是 NVIDIA 的营收、
+                // 净利、每股收益，是十位董事的赞成票与反对票，全是有名有姓的
+                // 主语。属性那一档要求主语有类型（domain 要校验），这一档没有
+                // domain 可校验，也就没有理由比关系那条路更严
+                let subject_id = match f.subject_ref.as_deref().map(str::trim) {
+                    Some(handle) => match referenced_entity(&ref_entities, handle) {
+                        Some(bound) => bound.id,
+                        None => {
+                            drop_signal(
+                                state,
+                                doc.kb_id,
+                                document_id,
+                                utopia_store::extraction_drops::reason::MALFORMED_ITEM,
+                                &f.predicate,
+                                Some(handle),
+                            )
+                            .await;
+                            continue;
+                        }
+                    },
+                    None => {
+                        match no_ref_name_binding(&entity_ids, &handled_by_name, subject_name) {
+                            NoRefNameBinding::Legacy(id) => id,
+                            NoRefNameBinding::AmbiguousHandled | NoRefNameBinding::Missing => {
+                                touched_names.insert(
+                                    utopia_store::resolution::normalize_name(subject_name)
+                                        .to_lowercase(),
+                                );
+                                resolve_bare(
+                                    &state.pool,
+                                    doc.kb_id,
+                                    entity_type_of.get(subject_name).copied().flatten(),
+                                    subject_name,
+                                    ctx,
+                                    Some(&chunk.text),
+                                    &mut doc_cache,
+                                    &handled_by_name,
+                                    &mut ambiguous_bare_cache,
+                                    &mut needs_adjudication,
+                                    &mut human_reviews_found,
+                                )
+                                .await?
+                            }
+                        }
+                    }
                 };
                 let _ = utopia_store::ontology::record_miss(
                     &state.pool,
                     doc.kb_id,
                     "attribute_type",
-                    &f.predicate,
+                    &surface,
                     Some(&format!("{subject_name} → {value}")),
                 )
                 .await;
-                let literal = serde_json::json!({ "value": value });
+                /* 值照原文落笔（提示词 8a 要的就是「units and all」），**单位另记一格**。
+                采纳成属性时按 datatype 把 `$5 billion` 换算成 5e9，那一步只看得懂
+                数；符号丢在原文里就再也取不出来了，而「5000000000」少了那个 `$`
+                就不知道是钱还是别的什么 */
+                let unit = value
+                    .as_str()
+                    .and_then(utopia_extract::parse_quantity)
+                    .and_then(|(_, u)| u);
+                let mut literal = serde_json::json!({ "value": value });
+                if let Some(unit) = unit {
+                    literal["unit"] = serde_json::Value::String(unit);
+                }
+                let literal = literal;
                 if await_nod {
                     if let utopia_store::pending::Outcome::Proposed(_) =
                         utopia_store::pending::propose(
@@ -1289,7 +1960,7 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
                                 predicate_id: None,
                                 object_id: None,
                                 object_value: Some(&literal),
-                                proposed_predicate: Some(f.predicate.as_str()),
+                                proposed_predicate: Some(surface.as_str()),
                                 validity,
                                 confidence,
                                 chunk_id: chunk.id,
@@ -1319,7 +1990,7 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
                     fact_id,
                     chunk.id,
                     f.quote.as_deref(),
-                    Some(f.predicate.as_str()),
+                    Some(surface.as_str()),
                 )
                 .await?;
                 if created {
@@ -1383,9 +2054,155 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
                 }
             }
 
-            // 主宾未在 entities 中声明时先建出来（模型偶尔漏报）。没有 entities 那条
-            // 记录就没有类型可依，留空即可——0009 之前这里只能塞 concept
-            let subject_id = match f.subject_ref.as_deref().map(str::trim) {
+            // **槽位片段核对**（#582，取代 #578 的词表）：模型交出引文里点名每一侧的那几个
+            // 字，机器核对（`verify_span`）。描述做主语不落、做宾语落成字面值；点了别的
+            // 实体就改绑；其余都只记不拦
+            let quote_text = f.quote.as_deref().unwrap_or("");
+            // 对着绑上的名字看：有 ref 就是 ref 指的那个实体的名字，没有就是模型写的名字
+            let bound_subject = bound_name(&ref_names, f.subject_ref.as_deref(), f.subject.trim());
+            let bound_object = bound_name(&ref_names, f.object_ref.as_deref(), object_name);
+            // 片段说了算；片段没说清（放行、不在引文、前缀、指代）时，再看模型写的名字
+            // 跟它 ref 指的实体对不对得上
+            let decisive = |v: &SpanVerdict| {
+                matches!(
+                    v,
+                    SpanVerdict::Described(_) | SpanVerdict::Rebind(_) | SpanVerdict::Misplaced(_)
+                )
+            };
+            let mut subject_verdict = verify_span(
+                f.subject_span.as_deref(),
+                bound_subject,
+                bound_object,
+                quote_text,
+                &span_declared,
+            );
+            if !decisive(&subject_verdict) {
+                let w = written_verdict(
+                    f.subject.trim(),
+                    bound_subject,
+                    bound_object,
+                    f.subject_ref.is_some(),
+                    &span_declared,
+                );
+                if decisive(&w) {
+                    subject_verdict = w;
+                }
+            }
+            let mut object_verdict = verify_span(
+                f.object_span.as_deref(),
+                bound_object,
+                bound_subject,
+                quote_text,
+                &span_declared,
+            );
+            if !decisive(&object_verdict) {
+                let w = written_verdict(
+                    object_name,
+                    bound_object,
+                    bound_subject,
+                    f.object_ref.is_some(),
+                    &span_declared,
+                );
+                if decisive(&w) {
+                    object_verdict = w;
+                }
+            }
+            let mut rebound_subject: Option<String> = None;
+            let mut rebound_object: Option<String> = None;
+            let mut object_described: Option<String> = None;
+            let mut subject_described = false;
+            for (side, verdict, span, bound) in [
+                (
+                    "subject",
+                    &subject_verdict,
+                    f.subject_span.as_deref(),
+                    bound_subject,
+                ),
+                (
+                    "object",
+                    &object_verdict,
+                    f.object_span.as_deref(),
+                    bound_object,
+                ),
+            ] {
+                let (reason, example) = match verdict {
+                    SpanVerdict::Ok => continue,
+                    SpanVerdict::NotInQuote => (
+                        utopia_store::extraction_drops::reason::SPAN_NOT_IN_QUOTE,
+                        format!("{} ({bound})", span.unwrap_or("")),
+                    ),
+                    SpanVerdict::Rebind(name) => {
+                        if side == "subject" {
+                            rebound_subject = Some(name.clone());
+                        } else {
+                            rebound_object = Some(name.clone());
+                        }
+                        (
+                            utopia_store::extraction_drops::reason::SPAN_REBOUND,
+                            format!("{} → {name} (was {bound})", span.unwrap_or("")),
+                        )
+                    }
+                    SpanVerdict::Described(text) => {
+                        if side == "subject" {
+                            subject_described = true;
+                            (
+                                utopia_store::extraction_drops::reason::SUBJECT_DESCRIBED,
+                                format!("{text} ({bound})"),
+                            )
+                        } else {
+                            object_described = Some(text.clone());
+                            (
+                                utopia_store::extraction_drops::reason::OBJECT_DESCRIBED,
+                                format!("{text} ({bound})"),
+                            )
+                        }
+                    }
+                    SpanVerdict::Prefixed(text) => (
+                        utopia_store::extraction_drops::reason::SPAN_PREFIXED,
+                        format!("{text} ({bound})"),
+                    ),
+                    SpanVerdict::Coreference(text) => (
+                        utopia_store::extraction_drops::reason::SPAN_COREFERENCE,
+                        format!("{text} ({bound})"),
+                    ),
+                    SpanVerdict::Misplaced(text) => (
+                        utopia_store::extraction_drops::reason::SPAN_MISPLACED,
+                        format!("{text} ({bound})"),
+                    ),
+                };
+                drop_signal(
+                    state,
+                    doc.kb_id,
+                    document_id,
+                    reason,
+                    &f.predicate,
+                    Some(&example),
+                )
+                .await;
+            }
+            if subject_described {
+                continue;
+            }
+            let subject_name: &str = rebound_subject.as_deref().unwrap_or(f.subject.trim());
+            let subject_ref_eff: Option<&str> = if rebound_subject.is_some() {
+                None
+            } else {
+                f.subject_ref.as_deref().map(str::trim)
+            };
+            let object_name: &str = rebound_object.as_deref().unwrap_or(object_name);
+            let object_ref_eff: Option<&str> =
+                if rebound_object.is_some() || object_described.is_some() {
+                    None
+                } else {
+                    f.object_ref.as_deref().map(str::trim)
+                };
+            // 主宾没在 entities 里声明时（模型偶尔漏报）：库里已经有这个名字的就用它，
+            // 库里也没有的**不建**（#559）。从前这里一律先建出来、类型留空，结果
+            // 一个库里 20% 的实体是 "lawsuit against OpenAI"、"$5 billion"、"March 2024"
+            // 这样的描述——几乎全部只当过宾语，从没当过主语。漏报的实体多半在
+            // 前面的分块或别的文档里已经声明过，按名字找得到；找不到的就是描述。
+            // 描述做主语的事实丢掉并记账，做宾语的事实照落，宾语落成字面值
+            let subject_id = match subject_ref_eff {
                 Some(handle) => match referenced_entity(&ref_entities, handle) {
                     Some(bound) => bound.id,
                     None => {
@@ -1402,18 +2219,39 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
                     }
                 },
                 None => {
-                    match no_ref_name_binding(&entity_ids, &handled_by_name, f.subject.trim()) {
+                    let binding = no_ref_name_binding(&entity_ids, &handled_by_name, subject_name);
+                    if matches!(binding, NoRefNameBinding::Missing)
+                        && utopia_store::resolution::existing_by_name(
+                            &state.pool,
+                            doc.kb_id,
+                            subject_name,
+                        )
+                        .await?
+                        .is_none()
+                    {
+                        drop_signal(
+                            state,
+                            doc.kb_id,
+                            document_id,
+                            utopia_store::extraction_drops::reason::SUBJECT_NOT_DECLARED,
+                            &f.predicate,
+                            Some(subject_name),
+                        )
+                        .await;
+                        continue;
+                    }
+                    match binding {
                         NoRefNameBinding::Legacy(id) => id,
                         NoRefNameBinding::AmbiguousHandled | NoRefNameBinding::Missing => {
                             touched_names.insert(
-                                utopia_store::resolution::normalize_name(f.subject.trim())
+                                utopia_store::resolution::normalize_name(subject_name)
                                     .to_lowercase(),
                             );
                             resolve_bare(
                                 &state.pool,
                                 doc.kb_id,
                                 None,
-                                f.subject.trim(),
+                                subject_name,
                                 ctx,
                                 Some(&chunk.text),
                                 &mut doc_cache,
@@ -1427,7 +2265,7 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
                     }
                 }
             };
-            let object_id = match f.object_ref.as_deref().map(str::trim) {
+            let object_id = match object_ref_eff {
                 Some(handle) => match referenced_entity(&ref_entities, handle) {
                     Some(bound) => bound.id,
                     None => {
@@ -1443,28 +2281,122 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
                         continue;
                     }
                 },
-                None => match no_ref_name_binding(&entity_ids, &handled_by_name, object_name) {
-                    NoRefNameBinding::Legacy(id) => id,
-                    NoRefNameBinding::AmbiguousHandled | NoRefNameBinding::Missing => {
-                        touched_names.insert(
-                            utopia_store::resolution::normalize_name(object_name).to_lowercase(),
-                        );
-                        resolve_bare(
+                None => {
+                    let binding = no_ref_name_binding(&entity_ids, &handled_by_name, object_name);
+                    if object_described.is_some()
+                        || (matches!(binding, NoRefNameBinding::Missing)
+                            && utopia_store::resolution::existing_by_name(
+                                &state.pool,
+                                doc.kb_id,
+                                object_name,
+                            )
+                            .await?
+                            .is_none())
+                    {
+                        // 没声明、库里也没有，或者片段说它是个描述：宾语落成字面值。谓词照旧对本体；
+                        // 被动形（`_by`）本该主宾对调，而字面值当不了主语，那条就不给谓词，
+                        // 原词留在证据上
+                        let predicate_id = match pred_index.lookup(f.predicate.as_str()) {
+                            Some((id, false)) => Some(id),
+                            Some((_, true)) => None,
+                            None => {
+                                let _ = utopia_store::ontology::record_miss(
+                                    &state.pool,
+                                    doc.kb_id,
+                                    "relation_type",
+                                    &f.predicate,
+                                    Some(&format!("{} → {}", f.subject, object_name)),
+                                )
+                                .await;
+                                None
+                            }
+                        };
+                        let literal_text: &str = object_described.as_deref().unwrap_or(object_name);
+                        // 描述那一路在上面核对时已经记过账；这里只记「没声明」的
+                        if object_described.is_none() {
+                            drop_signal(
+                                state,
+                                doc.kb_id,
+                                document_id,
+                                utopia_store::extraction_drops::reason::OBJECT_UNDECLARED,
+                                &f.predicate,
+                                Some(object_name),
+                            )
+                            .await;
+                        }
+                        let literal = serde_json::json!({ "value": literal_text });
+                        if await_nod {
+                            if let utopia_store::pending::Outcome::Proposed(_) =
+                                utopia_store::pending::propose(
+                                    &state.pool,
+                                    utopia_store::pending::Proposal {
+                                        kb_id: doc.kb_id,
+                                        subject_id,
+                                        predicate_id,
+                                        object_id: None,
+                                        object_value: Some(&literal),
+                                        proposed_predicate: Some(f.predicate.as_str()),
+                                        validity,
+                                        confidence,
+                                        chunk_id: chunk.id,
+                                        proposed_by: proposer.user_id,
+                                        proposed_token: proposer.token_id,
+                                    },
+                                )
+                                .await?
+                            {
+                                pending_count += 1;
+                            }
+                            continue;
+                        }
+                        let (fact_id, created) = utopia_store::graph::insert_value_fact(
                             &state.pool,
                             doc.kb_id,
-                            None,
-                            object_name,
-                            ctx,
-                            Some(&chunk.text),
-                            &mut doc_cache,
-                            &handled_by_name,
-                            &mut ambiguous_bare_cache,
-                            &mut needs_adjudication,
-                            &mut human_reviews_found,
+                            subject_id,
+                            predicate_id,
+                            &literal,
+                            validity,
+                            confidence,
                         )
-                        .await?
+                        .await?;
+                        touched_facts.push(fact_id);
+                        utopia_store::graph::add_evidence(
+                            &state.pool,
+                            fact_id,
+                            chunk.id,
+                            f.quote.as_deref(),
+                            Some(f.predicate.as_str()),
+                        )
+                        .await?;
+                        if created {
+                            fact_count += 1;
+                        }
+                        continue;
                     }
-                },
+                    match binding {
+                        NoRefNameBinding::Legacy(id) => id,
+                        NoRefNameBinding::AmbiguousHandled | NoRefNameBinding::Missing => {
+                            touched_names.insert(
+                                utopia_store::resolution::normalize_name(object_name)
+                                    .to_lowercase(),
+                            );
+                            resolve_bare(
+                                &state.pool,
+                                doc.kb_id,
+                                None,
+                                object_name,
+                                ctx,
+                                Some(&chunk.text),
+                                &mut doc_cache,
+                                &handled_by_name,
+                                &mut ambiguous_bare_cache,
+                                &mut needs_adjudication,
+                                &mut human_reviews_found,
+                            )
+                            .await?
+                        }
+                    }
+                }
             };
             if subject_id == object_id {
                 continue;
@@ -1624,6 +2556,179 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
                 )
                 .await?;
                 touched_facts.push(fact_id);
+                /* **边上的属性落笔**（0037）。属性不进去重键：`insert_fact` 复用了旧行也照写——
+                同一条边再听到一次带了金额的，是同一条边补上金额。
+                值照 datatype 换算，单位另记一格（与 object_value 同形）；
+                key 不在声明里、换不动、与已记的不一致——三种都进丢弃表，不静默 */
+                /* 谓词未知（0010，说法在证据上）时属性照写：值落在事实上，声明等
+                关系被采纳时在 `adopt` 里补。不写的话，`invested_in` 在 schema.org
+                库里是未知说法，一句话里的 $1.5 billion 就没有地方放——召回台上
+                `oh-invest` 那一条正是这么丢的 */
+                if let Some(quals) = f.qualifiers.as_ref() {
+                    let pid = predicate_id;
+                    // 克隆出这一组引用：下面撞上已有属性时要往 qualifier_defs 里追加声明
+                    let defs: Vec<&utopia_core::models::RelationType> = pid
+                        .and_then(|p| qualifier_defs.get(&p).cloned())
+                        .unwrap_or_default();
+                    /* 模型常把币种单独写成一个键（`"amount": "1500000000", "currency": "CNY"`），
+                    而不是写进数额里。那不是一个属性，是数额的单位——先把它拿出来，
+                    数值属性解不出单位时用它，别让它作为未知 key 进丢弃表 */
+                    let sibling_currency: Option<&'static str> = quals
+                        .iter()
+                        .find(|(k, _)| {
+                            matches!(
+                                k.trim().to_lowercase().as_str(),
+                                "currency" | "币种" | "货币" | "unit" | "单位"
+                            )
+                        })
+                        .and_then(|(_, v)| v.as_str())
+                        .and_then(utopia_extract::currency_unit);
+                    for (key, raw) in quals {
+                        // 模型对没提到的属性会写 null：那是「原文没说」，不是坏值，不记
+                        if raw.is_null() {
+                            continue;
+                        }
+                        if matches!(
+                            key.trim().to_lowercase().as_str(),
+                            "currency" | "币种" | "货币" | "unit" | "单位"
+                        ) {
+                            continue;
+                        }
+                        let declared = defs
+                            .iter()
+                            .find(|q| q.key.eq_ignore_ascii_case(key.trim()))
+                            .copied();
+                        /* **未知 key 撞上本库已有的属性定义 → 补一条声明，不丢值。**
+                        实测不声明时模型照样写 `amount`、`stake`、`round`，八条全进
+                        丢弃表——而这三个属性定义明明都在库里，缺的只是关系上的一条
+                        声明。补声明不新建任何东西、可撤（本体页取消勾选即可），
+                        所以跟自动扩本体走同一个开关 */
+                        let adopted = match declared {
+                            Some(d) => Some(d),
+                            /* 谓词还未知（0010，说法在证据上）：没有关系可声明，值绑到库里
+                            已有的属性定义、先落在事实上，采纳时 `adopt` 再补声明。这一步
+                            不动本体，所以不看自动扩本体的开关 */
+                            None if pid.is_none() => {
+                                attr_by_key.get(&key.trim().to_lowercase()).copied()
+                            }
+                            None if kb.auto_extend_ontology => {
+                                match attr_by_key.get(&key.trim().to_lowercase()).copied() {
+                                    Some(attr) => {
+                                        let pid = pid.expect("checked above");
+                                        match utopia_store::ontology::add_relation_qualifier(
+                                            &state.pool,
+                                            doc.kb_id,
+                                            pid,
+                                            attr.id,
+                                        )
+                                        .await
+                                        {
+                                            Ok(()) => {
+                                                tracing::info!(kb_id = %doc.kb_id, relation = %f.predicate, qualifier = %attr.key, "边上的属性按语料补了声明");
+                                                qualifier_defs.entry(pid).or_default().push(attr);
+                                                Some(attr)
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(kb_id = %doc.kb_id, error = %e, "补声明失败");
+                                                None
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        tracing::debug!(kb_id = %doc.kb_id, relation = %f.predicate, key = %key, attrs = attr_by_key.len(), "边上的属性：key 撞不上本库任何属性定义");
+                                        None
+                                    }
+                                }
+                            }
+                            None => {
+                                tracing::debug!(kb_id = %doc.kb_id, relation = %f.predicate, key = %key, auto_extend = kb.auto_extend_ontology, "边上的属性：未声明且不自动扩本体");
+                                None
+                            }
+                        };
+                        let Some(def) = adopted else {
+                            /* **绑不上属性定义的数也不丢。** 库里没有这个属性（schema.org 里
+                            `amount` 是关系不是属性）、或本体冻着不让扩——从前这里进丢弃表，
+                            数就只剩丢弃表里的一个样例。现在照 8a 的样子落成主语上的一条
+                            字面值事实：值按原文、单位另记一格、原词 `关系.键` 进证据的
+                            proposed_predicate，缺的定义记进 ontology_misses（0010 的样子），
+                            采纳时人来决定它归哪儿。图里有它、有证据、能查到 */
+                            let wording = format!("{}.{}", f.predicate.trim(), key.trim());
+                            let unit = raw
+                                .as_str()
+                                .and_then(utopia_extract::parse_leading_quantity)
+                                .and_then(|(_, u)| u)
+                                .or_else(|| sibling_currency.map(str::to_string));
+                            let mut literal = serde_json::json!({ "value": raw });
+                            if let Some(u) = unit {
+                                literal["unit"] = serde_json::Value::String(u);
+                            }
+                            let _ = utopia_store::ontology::record_miss(
+                                &state.pool,
+                                doc.kb_id,
+                                "attribute_type",
+                                &wording,
+                                Some(&format!("{} → {raw}", f.subject.trim())),
+                            )
+                            .await;
+                            let (literal_id, _) = utopia_store::graph::insert_value_fact(
+                                &state.pool,
+                                doc.kb_id,
+                                subject_id,
+                                None,
+                                &literal,
+                                validity,
+                                confidence,
+                            )
+                            .await?;
+                            touched_facts.push(literal_id);
+                            utopia_store::graph::add_evidence(
+                                &state.pool,
+                                literal_id,
+                                chunk.id,
+                                f.quote.as_deref(),
+                                Some(wording.as_str()),
+                            )
+                            .await?;
+                            tracing::debug!(kb_id = %doc.kb_id, wording = %wording, "边上的属性绑不上定义，落成主语上的字面值");
+                            continue;
+                        };
+                        let dt = def.datatype.as_deref().unwrap_or("text");
+                        let Some(normalized) = utopia_extract::normalize_attr_value(dt, raw) else {
+                            drop_signal(
+                                state,
+                                doc.kb_id,
+                                document_id,
+                                utopia_store::extraction_drops::reason::QUALIFIER_DATATYPE,
+                                &format!("{}.{} ({dt})", f.predicate, def.key),
+                                Some(&raw.to_string()),
+                            )
+                            .await;
+                            continue;
+                        };
+                        let mut value = serde_json::json!({ "value": normalized });
+                        if let Some(u) = unit_for(raw, dt, sibling_currency, def.unit.as_deref()) {
+                            value["unit"] = serde_json::Value::String(u);
+                        }
+                        let write = utopia_store::graph::upsert_fact_qualifier(
+                            &state.pool,
+                            fact_id,
+                            def.id,
+                            &value,
+                        )
+                        .await?;
+                        if write == utopia_store::graph::QualifierWrite::Conflict {
+                            drop_signal(
+                                state,
+                                doc.kb_id,
+                                document_id,
+                                utopia_store::extraction_drops::reason::QUALIFIER_CONFLICT,
+                                &format!("{}.{}", f.predicate, def.key),
+                                Some(&raw.to_string()),
+                            )
+                            .await;
+                        }
+                    }
+                }
                 // 重复观察也要挂证据：多来源相互印证，任一来源删除后事实不孤儿化。
                 // 表层谓词随每次观察落笔——甲块说 "runs on"、乙块说 "optimized for"
                 // 会并进同一条事实，放事实上就是先写者胜，放证据上两个都留着
@@ -1635,12 +2740,12 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
                     Some(f.predicate.as_str()),
                 )
                 .await?;
-                if !created {
-                    continue;
+                if created {
+                    fact_count += 1;
                 }
-                fact_count += 1;
                 // 时态对账：带唯一性约束的状态关系落新事实即检测矛盾（纯规则点查，
-                // 自动闭合走"作废+改写"，拿不准进 fact_conflicts 人裁）
+                // 自动闭合走"作废+改写"，拿不准进 fact_conflicts 人裁）。并进已有断言的
+                // 也对：多了一份证据，时间线的形状可能跟着变（#679）
                 // 没有谓词就没有关系元数据，也就不参与时态对账——
                 // 一条说不出是什么关系的边，本来就不可能带唯一性约束
                 if let Some((pid, (func, inv_func, temporal))) =
@@ -1764,7 +2869,9 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
             .await?;
         }
     } else if needs_adjudication {
-        utopia_store::jobs::enqueue(
+        // 同库已排着的不重复——与下面的 resolve_types 一样。一批文档同时抽完
+        // 会各排一个，而它们读到的是同一批待裁项
+        utopia_store::jobs::enqueue_unless_queued(
             &state.pool,
             "adjudicate_entities",
             serde_json::json!({ "kb_id": doc.kb_id }),
@@ -1795,6 +2902,22 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
     Ok(())
 }
 
+/// 一条事实同时给了值和宾语时，宾语是不是一个**没声明的短语**（#685）：没有句柄，
+/// 也不是本次回复或本文档前面认下的名字（大小写不计）。是的话这条事实按值落，
+/// 宾语短语并进表层谓词；不是的话宾语是个实体，照旧走边
+fn undeclared_beside_value(
+    object_ref: Option<&str>,
+    object: &str,
+    declared: &HashMap<String, Uuid>,
+) -> bool {
+    let object = object.trim();
+    !object.is_empty()
+        && object_ref.map(str::trim).is_none_or(str::is_empty)
+        && !declared
+            .keys()
+            .any(|name| name.trim().eq_ignore_ascii_case(object))
+}
+
 /// 宾语位上的这串东西，是不是一个字面值而不是实体的名字。
 ///
 /// **只认数字与日期。** 这是个会吃掉真实体的判断，所以宁可漏认：
@@ -1803,18 +2926,60 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
 ///
 /// "2015"、"2023-03"、"6" 认；"杭州"、"首席技术官"、"3M"、"V3" 不认。
 /// 调用方还额外要求模型**没有**把它声明成实体——两道门一起过才算数。
+/// 模型给的区间两端 → 落库的有效区间。
+///
+/// **两端各记各的粒度**（见 `facts.valid_to_precision`）。从前一个精度列描述两个端点，
+/// 于是「2020 年开始、2023-05-06 结束」这种只能共用一个值。两端都用 `read_time` 读：
+/// 规则 3 的格式，或写法说得清是哪天的日期（#688），精度随写了几位。
+///
+/// 模型给的 valid_to = "unknown" 表示**原文说它结束了、但没说哪天**。
+/// read_time 解不出它（本来就不是日期），落在这里显式认掉——
+/// 不认的话它退化成 None，那条事实就又变回"仍在持续"了
+fn validity_of(
+    valid_from: Option<&str>,
+    valid_to: Option<&str>,
+    doc_time: Option<chrono::DateTime<chrono::Utc>>,
+) -> utopia_store::graph::Validity<'static> {
+    let from = valid_from.and_then(utopia_extract::read_time);
+    let to = valid_to.and_then(utopia_extract::read_time);
+    let ended_unknown = valid_to
+        .map(str::trim)
+        .is_some_and(|v| v.eq_ignore_ascii_case(utopia_store::graph::ENDED_UNKNOWN));
+    utopia_store::graph::Validity {
+        from: from.map(|(t, _)| t),
+        from_precision: from.map(|(_, p)| p),
+        to: to.map(|(t, _)| t),
+        to_precision: to
+            .map(|(_, p)| p)
+            .or(ended_unknown.then_some(utopia_store::graph::ENDED_UNKNOWN)),
+        // 这次观察出自哪一天的文档（0022）：没起点的事实从它起成立，结束了
+        // 不知哪天的到它为止。没有文档日期就是记下的此刻——账本能给的最好的
+        attested_at: doc_time,
+    }
+}
+
 fn looks_literal(s: &str) -> bool {
     let s = s.trim();
     if s.is_empty() {
         return false;
     }
-    // 纯数字（含小数与正负号）。用 f64 解而不是自己扫字符：
-    // "3M"、"V3"、"２０１５"（全角）都会失败，正是想要的
-    if s.parse::<f64>().is_ok() {
+    /* **整体是一个量**：可选货币符号 + 数字 + 可选量级词 + 可选百分号，
+    此外一个词都不许有（判据与例子见 `parse_quantity`）。
+
+    从前这里只认裸数字（`s.parse::<f64>()`），于是 `$5 billion` 两头不着：
+    它不是裸数字、也解不成日期，掉进关系那条路，凭空长出一个叫「$5 billion」
+    的节点。同名的又会并成一个点，于是 SSI Inc. 与 Nvidia 因为都出现过这个
+    数额而在图上相连——一条没有含义的路径。实测一个 1415 实体的库里，8 个
+    这样的点、15 条事实指着它们，而**没有任何一条拿它们当主语**：
+    一个从不当主语、只当宾语、名字整体是个量的东西，是值，不是实体。
+
+    `parse_quantity` 已经把裸数字那一档包含在内（`"42"` → 42），
+    所以这里不必再单留一条。全角「２０１５」仍旧解不动，仍旧是想要的 */
+    if utopia_extract::parse_quantity(s).is_some() {
         return true;
     }
-    // 日期：复用抽取侧那个解析器，它认 2015 / 2015-03 / 2015-03-01 等
-    utopia_extract::parse_time(s).is_some()
+    // 日期：复用抽取侧那个解析器，它认 2015 / 2015-03 / 2015-03-01，也认写出来的日期（#688）
+    utopia_extract::read_time(s).is_some()
 }
 
 /// 提示词里那三段清单：类、关系、属性。
@@ -1844,6 +3009,19 @@ impl PromptLists {
     }
 }
 
+/// 把当前本体在提示词里的字符数算出来。**空铺**（不筛类/关系）——这就是
+/// `extract_document` 用的「全铺」档，也是判断「要不要按块检索」的标准。
+///
+/// 抽成独立函数是因为 `ontology_index::gate_required`（#526）要在加载抽取器
+/// 之前问一次预算——那时 `build_lists` 还没被调用。两个路径必须用同一个判据，
+/// 否则 gate 的判定会和实际的「全铺」走分。
+pub(crate) fn full_ontology_chars(
+    etypes: &[utopia_core::models::EntityType],
+    rtypes: &[utopia_core::models::RelationType],
+) -> usize {
+    build_lists(etypes, rtypes, None, None).chars()
+}
+
 /// 从一个**选择集**排出三段清单。`None` = 全给（本体小于预算时的老路）。
 ///
 /// 三处细节都是选择带来的，全给时它们不会触发：
@@ -1861,6 +3039,32 @@ fn build_lists(
     rels: Option<&HashSet<Uuid>>,
 ) -> PromptLists {
     let picked_class = |id: &Uuid| classes.is_none_or(|s| s.contains(id));
+    // 按块检索（有选择集）时描述只带第一句：检索那条路只有大的导入本体才走，一块铺上百行，
+    // 描述占清单的八成（#701）。全铺的是装得下预算的小本体，描述原样
+    let describe = |d: &str| -> String {
+        if classes.is_some() {
+            utopia_extract::first_sentence(d).to_string()
+        } else {
+            d.to_string()
+        }
+    };
+    // 边上能带的属性：关系.qualifiers → 属性行（0037）。这里只排版，写入侧另有一份同样的查法
+    let rtype_by_id: HashMap<Uuid, &utopia_core::models::RelationType> =
+        rtypes.iter().map(|r| (r.id, r)).collect();
+    let qualifier_line = |r: &utopia_core::models::RelationType| -> Vec<String> {
+        r.qualifiers
+            .iter()
+            .filter_map(|q| rtype_by_id.get(q).copied())
+            .filter(|q| q.kind == "attribute")
+            .map(|q| {
+                let dt = q.datatype.as_deref().unwrap_or("text");
+                match q.unit.as_deref().filter(|u| !u.is_empty()) {
+                    Some(u) => format!("{}: {dt} {u}", q.key),
+                    None => format!("{}: {dt}", q.key),
+                }
+            })
+            .collect()
+    };
     let picked_rel = |id: &Uuid| rels.is_none_or(|s| s.contains(id));
     let key_of: HashMap<Uuid, &str> = etypes
         .iter()
@@ -1871,7 +3075,7 @@ fn build_lists(
     let types = etypes
         .iter()
         .filter(|t| picked_class(&t.id))
-        .map(|t| (t.key.clone(), t.label.clone(), t.description.clone()))
+        .map(|t| (t.key.clone(), t.label.clone(), describe(&t.description)))
         .collect();
 
     // 一侧的类一个都没铺出去就写 `*`：签名是导向，指向看不见的类只会误导
@@ -1899,8 +3103,11 @@ fn build_lists(
             utopia_extract::PromptRelation {
                 key: r.key.clone(),
                 label: r.label.clone(),
-                description: r.description.clone(),
+                description: describe(&r.description),
                 signature,
+                temporal: r.temporal.clone(),
+                // `amount: number $`——模型要按这个 key 写，单位提醒它别换算
+                qualifiers: qualifier_line(r),
             }
         })
         .collect();
@@ -1916,7 +3123,8 @@ fn build_lists(
                 Some(u) if !u.is_empty() => format!("{dt}, {u}"),
                 _ => dt.to_string(),
             };
-            let d = r.description.trim();
+            let d = describe(&r.description);
+            let d = d.trim();
             Some(if d.is_empty() {
                 format!("- {class_key}.{} ({spec})", r.key)
             } else {
@@ -1936,6 +3144,13 @@ fn build_lists(
 const PER_CHUNK_CLASSES: i64 = 40;
 const PER_CHUNK_RELATIONS: i64 = 30;
 const PER_CHUNK_ATTRIBUTES: i64 = 30;
+/// 「这批类身上声明的关系／属性」这道地板给多少名额。
+///
+/// 比按相似度那 30 个宽得多，因为它的池子已经被 domain 收窄过一轮——
+/// schema.org 里 person + organization + corporation 三个类身上一共只有 86 个关系。
+/// 上限只是防病态情况（一块认出上百个类），不是筛选手段。
+const PER_CHUNK_DOMAIN_RELATIONS: i64 = 120;
+const PER_CHUNK_DOMAIN_ATTRIBUTES: i64 = 40;
 
 /// 按这一块的向量检索候选，排出这一块专用的三段清单。
 ///
@@ -1948,6 +3163,7 @@ async fn chunk_lists(
     etypes: &[utopia_core::models::EntityType],
     rtypes: &[utopia_core::models::RelationType],
     seed_classes: &HashSet<Uuid>,
+    budget: usize,
 ) -> anyhow::Result<Option<PromptLists>> {
     let mut classes: HashSet<Uuid> = seed_classes.clone();
     classes.extend(
@@ -1983,10 +3199,9 @@ async fn chunk_lists(
         let picked: Vec<Uuid> = classes.iter().copied().collect();
         classes.extend(utopia_store::ontology::ancestors_of(&state.pool, &picked).await?);
     }
-    let mut rels: HashSet<Uuid> = HashSet::new();
     // 关系与属性分开检索：两段在提示词里是分开的，混在一起取会让其中一段
-    // 被另一段挤空
-    rels.extend(
+    // 被另一段挤空。检索回来是按距离排好的，排队时交替取，两段一起往下让
+    let nearest = interleave(
         utopia_store::ontology::nearest_relation_type_ids(
             &state.pool,
             kb_id,
@@ -1995,8 +3210,6 @@ async fn chunk_lists(
             Some("relation"),
         )
         .await?,
-    );
-    rels.extend(
         utopia_store::ontology::nearest_relation_type_ids(
             &state.pool,
             kb_id,
@@ -2006,6 +3219,7 @@ async fn chunk_lists(
         )
         .await?,
     );
+    let rels: HashSet<Uuid> = nearest.iter().copied().collect();
     // **一个关系被铺出去，它签名点名的类就得跟着铺。**
     //
     // 类与关系是各自独立检索的，而签名依赖两者的交集——`sig_of` 只认铺出去的类，
@@ -2022,23 +3236,240 @@ async fn chunk_lists(
     // 顺带还对：这些类正是模型马上要用来判类型的那些，`employee` 在场就说明
     // 这一块讲的是雇佣，`organization`/`person` 本来就该在候选里——
     // 按字面相似度捞不到它们，但**本体的结构知道**。
-    let sig_classes: HashSet<Uuid> = rtypes
-        .iter()
-        .filter(|r| rels.contains(&r.id))
-        .flat_map(|r| r.domains.iter().chain(r.ranges.iter()).copied())
-        .collect();
-    classes.extend(sig_classes);
+    let signature_classes = |kept: &HashSet<Uuid>| -> HashSet<Uuid> {
+        rtypes
+            .iter()
+            .filter(|r| kept.contains(&r.id))
+            .flat_map(|r| r.domains.iter().chain(r.ranges.iter()).copied())
+            .collect()
+    };
+    let mut domain_pool = classes.clone();
+    domain_pool.extend(signature_classes(&rels));
+
+    // **类进来了，就把本体声明在它们身上的关系也铺出去。**
+    //
+    // 上面那道祖先地板治的是「类捞不到」，这道治的是「关系捞不到」——同一个
+    // 病的两侧。实测一块讲「Jensen Huang, founder and CEO of NVIDIA」的正文：
+    // `employee` 排第 10 进了窗口，模型就用了它；而 `founder` 排 267、
+    // `job_title` 排 618、`has_occupation` 排 811，一个都没进——**四篇文档里
+    // 每个人的职务因此全部没落进图，而且不留任何丢弃信号：模型没被问到，
+    // 也就什么都没说，drops 与 misses 两张表都看不见它**（2026-09-08 实测）。
+    //
+    // 收窄的判据是本体自己声明的 domain，不是又一次相似度猜测：这一块认出了
+    // person 与 organization，那么「本体说人和组织能有什么」就该摆在模型面前。
+    // 同一块里 `founder` 升到 29、`job_title` 升到 55（池子 86）。
+    //
+    // **放在 `sig_classes` 之后，是为了不让它反过来撑大类清单。** 放在前面时
+    // 这批关系的 range 会顺着签名规则把一大票类拉进来，同一块的提示词从 11.7k
+    // 涨到 21.4k——为了一个谓词付两倍的钱。它们的 domain 侧本来就在清单里
+    // （地板正是这么选出来的），range 侧退化成 `*` 可以接受：这道地板要办的事
+    // 是「让模型看见这个说法存在」，不是把签名补全。
+    let domain_ids: Vec<Uuid> = domain_pool.iter().copied().collect();
+    let mut on_domains = Vec::new();
+    for (limit, kind) in [
+        (PER_CHUNK_DOMAIN_RELATIONS, "relation"),
+        (PER_CHUNK_DOMAIN_ATTRIBUTES, "attribute"),
+    ] {
+        on_domains.push(
+            utopia_store::ontology::nearest_relation_type_ids_in_domains(
+                &state.pool,
+                kb_id,
+                embedding,
+                limit,
+                Some(kind),
+                &domain_ids,
+            )
+            .await?,
+        );
+    }
+    let domain_attributes = on_domains.pop().unwrap_or_default();
+    let domain_relations = on_domains.pop().unwrap_or_default();
+
+    // 排队：按相似度检索到的在前，地板补进来的在后
+    let mut seen = rels.clone();
+    let mut ranked = nearest;
+    ranked.extend(
+        interleave(domain_relations, domain_attributes)
+            .into_iter()
+            .filter(|id| seen.insert(*id)),
+    );
 
     // 一个候选都没检索到 = 索引还没建好，退回全量而不是给一份空清单
-    if classes.len() <= seed_classes.len() && rels.is_empty() {
+    if classes.len() <= seed_classes.len() && ranked.is_empty() {
         return Ok(None);
     }
-    Ok(Some(build_lists(
-        etypes,
-        rtypes,
-        Some(&classes),
-        Some(&rels),
-    )))
+
+    // **这一块的清单也守那个预算**（#701）。预算原本只判「全铺装不装得下」，检索出来的
+    // 清单没有上限：三道地板叠上去，schema.org 一块铺到 5.6 万字符，是预算的 2.3 倍，
+    // 提示词两万 token 里正文不到 2%。
+    //
+    // 按排队顺序取前 k 个，每个带着它的结构（签名点名的类；祖先在类清单里已经有了），量
+    // 实际排出来的那段字，取装得下的最大 k。多一个候选只会多几行，长度随 k 单调，二分就行。
+    // 地板补进来的关系不拉签名类，理由见上
+    let lists_for = |k: usize| {
+        let kept: HashSet<Uuid> = ranked[..k].iter().copied().collect();
+        let near_kept: HashSet<Uuid> = kept.intersection(&rels).copied().collect();
+        let mut picked = classes.clone();
+        picked.extend(signature_classes(&near_kept));
+        build_lists(etypes, rtypes, Some(&picked), Some(&kept))
+    };
+    let (mut lo, mut hi) = (0usize, ranked.len());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if lists_for(mid).chars() <= budget {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    if lo < ranked.len() {
+        tracing::debug!(
+            kept = lo,
+            retrieved = ranked.len(),
+            budget,
+            "按块清单按预算截断"
+        );
+    }
+    Ok(Some(lists_for(lo)))
+}
+
+/// 两串按距离排好的 id 交替并成一串：a0 b0 a1 b1 …，短的那串用完就接着排长的
+fn interleave(a: Vec<Uuid>, b: Vec<Uuid>) -> Vec<Uuid> {
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let (mut a, mut b) = (a.into_iter(), b.into_iter());
+    loop {
+        match (a.next(), b.next()) {
+            (None, None) => return out,
+            (x, y) => out.extend(x.into_iter().chain(y)),
+        }
+    }
+}
+
+/// 一条值该记什么单位（#600「单位是读出来的，不是猜的」，实体上的属性与边上的属性同一条规矩）。
+///
+/// 原文里认得出的用原文的（€、¥、%、"EUR 30 million" 的 €）；模型把币种单独写成
+/// 一个键时用那个；原文里写着声明的那个单位（"4300 人" 对 "人"）也算读出来的。
+/// 原文带着一个认不出的单位记号（"500 兆瓦"、"francs"）时**不能**拿声明的缺省顶上——
+/// 实测 `EUR 30 million` 被存成了 `$`，`500 兆瓦` 被存成了 500 块钱；单位写错比不写更糟。
+/// 只有原文完全没有单位记号（一个光秃秃的数）才落回声明的缺省。
+fn unit_for(
+    raw: &serde_json::Value,
+    datatype: &str,
+    sibling_currency: Option<&str>,
+    declared: Option<&str>,
+) -> Option<String> {
+    // 文本、日期、布尔值没有单位可言："3年"、"30日" 是文本，尾巴上的字不是单位
+    // ——实测「期限=3年」被记成了 `3年 年`
+    if datatype != "number" {
+        return None;
+    }
+    let declared = declared.map(str::trim).filter(|u| !u.is_empty());
+    let text = raw.as_str();
+    if let Some(u) = text
+        .and_then(utopia_extract::parse_leading_quantity)
+        .and_then(|(_, u)| u)
+    {
+        return Some(u);
+    }
+    if let (Some(c), "number") = (sibling_currency, datatype) {
+        return Some(c.to_string());
+    }
+    if let (Some(t), Some(d)) = (text, declared) {
+        if t.contains(d) {
+            return Some(d.to_string());
+        }
+    }
+    let has_unit_token = text.is_some_and(|t| {
+        t.chars()
+            .any(|c| c.is_alphabetic() || matches!(c, '$' | '€' | '£' | '¥' | '₩' | '₹' | '%'))
+    });
+    if has_unit_token {
+        None
+    } else {
+        declared.map(str::to_string)
+    }
+}
+
+#[cfg(test)]
+mod unit_for_tests {
+    use super::unit_for;
+    use serde_json::{json, Value};
+
+    fn s(t: &str) -> Value {
+        Value::String(t.to_string())
+    }
+
+    #[test]
+    fn a_unit_is_read_from_the_text_before_anything_else() {
+        assert_eq!(
+            unit_for(&s("EUR 30 million"), "number", None, Some("$")).as_deref(),
+            Some("€")
+        );
+        assert_eq!(
+            unit_for(&s("8.6亿元"), "number", None, Some("$")).as_deref(),
+            Some("¥")
+        );
+        assert_eq!(
+            unit_for(&s("12%"), "number", None, Some("¥")).as_deref(),
+            Some("%")
+        );
+        assert_eq!(
+            unit_for(&s("$5 billion"), "number", None, None).as_deref(),
+            Some("$")
+        );
+    }
+
+    #[test]
+    fn a_sibling_currency_is_the_unit_of_a_bare_number() {
+        assert_eq!(
+            unit_for(&s("1500000000"), "number", Some("CNY"), Some("$")).as_deref(),
+            Some("CNY")
+        );
+        // 文本型属性没有币种可言
+        assert_eq!(unit_for(&s("B 轮"), "text", Some("CNY"), None), None);
+        // 文本值尾巴上的字也不是单位："3年" 是期限的写法，不是 3 个「年」
+        assert_eq!(unit_for(&s("3年"), "text", None, Some("")), None);
+        assert_eq!(unit_for(&s("30日"), "text", None, None), None);
+    }
+
+    #[test]
+    fn the_declared_unit_written_in_the_text_counts_as_read() {
+        assert_eq!(
+            unit_for(&s("4300 人"), "number", None, Some("人")).as_deref(),
+            Some("人")
+        );
+    }
+
+    #[test]
+    fn an_unknown_unit_token_is_never_overwritten_by_the_default() {
+        // 宽松扫描把尾巴上的记号当单位读出来：记的是原文的单位，不是声明的 ¥
+        assert_eq!(
+            unit_for(&s("500 兆瓦"), "number", None, Some("¥")).as_deref(),
+            Some("兆瓦")
+        );
+        assert_eq!(
+            unit_for(&s("30 million francs"), "number", None, Some("$")).as_deref(),
+            Some("francs")
+        );
+        // 扫描读不出、原文却明明带着字：也不拿缺省顶上
+        assert_eq!(
+            unit_for(&s("about five hundred"), "number", None, Some("$")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_bare_figure_takes_the_declared_default() {
+        assert_eq!(
+            unit_for(&s("4300"), "number", None, Some("人")).as_deref(),
+            Some("人")
+        );
+        assert_eq!(
+            unit_for(&json!(4300), "number", None, Some("人")).as_deref(),
+            Some("人")
+        );
+        assert_eq!(unit_for(&s("4300"), "number", None, Some("")), None);
+    }
 }
 
 #[cfg(test)]
@@ -2056,6 +3487,32 @@ mod name_tests {
             "745 of OpenAI's 770 employees",
         ] {
             assert!(!is_entity_name(s), "这是一句话，不该当成实体名：{s}");
+        }
+    }
+
+    /// 一个数额不是一个东西。
+    ///
+    /// 样本取自实跑出来的库：`$5 billion`、`$1 billion`、`$30 billion` 各自成过节点，
+    /// 而且同名的会并成一个点——SSI Inc. 与 Nvidia 因为都出现过「$5 billion」
+    /// 在图上相连，那条路径没有任何含义。判据的窄处在**尾巴**：
+    /// 后面还有实词的一律放行，因为那时它说的就不再只是那个数。
+    #[test]
+    fn a_quantity_is_not_a_thing() {
+        for s in ["$5 billion", "€1.5 million", "52%", "3.5 million", "35,000"] {
+            assert!(!is_entity_name(s), "这是一个量，不该当成实体名：{s}");
+        }
+        // **以数字开头的真实体一个都不能误伤。** 量级词只认全写，所以 `3M` 解不动；
+        // 后面挂着实词的，尾巴那一条接住
+        for s in [
+            "3M",
+            "7-Eleven",
+            "23andMe",
+            "2025 Atlantic hurricane season",
+            "900 million weekly active users",
+            "1000 Islands",
+            "$10 billion investment",
+        ] {
+            assert!(is_entity_name(s), "这是真实体，不该被挡：{s}");
         }
     }
 
@@ -2138,17 +3595,462 @@ mod name_tests {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn two_ranked_lists_take_turns_and_the_longer_one_finishes() {
+        let ids: Vec<Uuid> = (0..5).map(|_| Uuid::now_v7()).collect();
+        let (a, b) = (vec![ids[0], ids[1], ids[2]], vec![ids[3]]);
+        assert_eq!(
+            super::interleave(a, b),
+            vec![ids[0], ids[3], ids[1], ids[2]]
+        );
+        assert!(super::interleave(Vec::new(), Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn a_name_declared_for_another_entity_is_not_an_alias() {
+        let (probe, project) = (Uuid::now_v7(), Uuid::now_v7());
+        let declared = HashMap::from([
+            ("海洋探测器1号".to_string(), probe),
+            ("海探1项目".to_string(), project),
+        ]);
+        assert!(name_claimed_elsewhere("海探1项目", probe, &declared));
+        assert!(
+            name_claimed_elsewhere(" 海探1项目 ", probe, &declared),
+            "空白不论"
+        );
+        assert!(
+            !name_claimed_elsewhere("海探1", probe, &declared),
+            "没人声明过的名字照收"
+        );
+        assert!(
+            !name_claimed_elsewhere("海洋探测器1号", probe, &declared),
+            "自己的名字不算撞"
+        );
+    }
+    use super::{name_claimed_elsewhere, slot_matches, span_in_quote, verify_span, SpanVerdict};
+    fn declared(names: &[&str]) -> HashMap<String, Uuid> {
+        names
+            .iter()
+            .map(|n| (n.to_string(), Uuid::now_v7()))
+            .collect()
+    }
+
+    /// 片段核对：#578 的两句真实错例；改绑；头衔与指代只记；正常的放行
+    #[test]
+    fn a_span_that_names_a_description_is_not_the_entity() {
+        let d = declared(&[
+            "OpenAI",
+            "Anthropic",
+            "Sam Altman",
+            "OpenAI's board of directors",
+            "The Verge",
+            "Tasha McCauley",
+        ]);
+        let quote = "Former OpenAI personnel have founded competing AI companies Anthropic, SpaceXAI, Safe Superintelligence Inc., and Thinking Machines Lab";
+        // 名字后面还有词：名字只是修饰语
+        assert_eq!(
+            verify_span(Some("Former OpenAI personnel"), "OpenAI", "", quote, &d),
+            SpanVerdict::Described("Former OpenAI personnel".into())
+        );
+        assert_eq!(
+            verify_span(Some("Anthropic"), "Anthropic", "", quote, &d),
+            SpanVerdict::Ok
+        );
+        // 所有格：名字只是修饰语
+        let q3 = "Claude bypassed Anthropic's safeguards";
+        assert_eq!(
+            verify_span(Some("Anthropic's safeguards"), "Anthropic", "", q3, &d),
+            SpanVerdict::Described("Anthropic's safeguards".into())
+        );
+        // 另一个名字带着修饰，绑到了第三方
+        assert_eq!(
+            verify_span(
+                Some("The Verge reporter"),
+                "Sam Altman",
+                "",
+                "a The Verge reporter wrote",
+                &d
+            ),
+            SpanVerdict::Described("The Verge reporter".into())
+        );
+        // 名字前面带了词：头衔还是另一件东西分不开，只记
+        let q2 = "Over one hundred companies using OpenAI contacted Anthropic";
+        assert_eq!(
+            verify_span(Some("companies using OpenAI"), "OpenAI", "", q2, &d),
+            SpanVerdict::Prefixed("companies using OpenAI".into())
+        );
+        assert_eq!(
+            verify_span(
+                Some("entrepreneur Tasha McCauley"),
+                "Tasha McCauley",
+                "",
+                "with entrepreneur Tasha McCauley on the board",
+                &d
+            ),
+            SpanVerdict::Prefixed("entrepreneur Tasha McCauley".into())
+        );
+        // 片段点了另一个声明过的实体：改绑，不丢
+        assert_eq!(
+            verify_span(
+                Some("Sam Altman"),
+                "OpenAI",
+                "",
+                "Sam Altman announced the deal",
+                &d
+            ),
+            SpanVerdict::Rebind("Sam Altman".into())
+        );
+        // 单个词包在别的名字里不改绑（#595）：句首大写不是专名的证据。"Altman" 绑错到
+        // OpenAI 时只记指代——改绑要么精确/词干命中，要么两个词以上
+        assert_eq!(
+            verify_span(
+                Some("Altman"),
+                "OpenAI",
+                "",
+                "Altman announced the deal",
+                &d
+            ),
+            SpanVerdict::Coreference("Altman".into())
+        );
+        assert_eq!(
+            verify_span(
+                Some("Stockholders"),
+                "NVIDIA",
+                "",
+                "Stockholders approved the election of each of our ten (10) director nominees",
+                &declared(&[
+                    "NVIDIA",
+                    "2026 Annual Meeting of Stockholders of NVIDIA Corporation"
+                ])
+            ),
+            SpanVerdict::Coreference("Stockholders".into())
+        );
+        assert_eq!(
+            verify_span(
+                Some("OpenAI's board"),
+                "OpenAI",
+                "",
+                "OpenAI's board removed Sam Altman as CEO",
+                &d
+            ),
+            SpanVerdict::Rebind("OpenAI's board of directors".into())
+        );
+        // 指代：没有任何名字，绑定照旧、只记
+        assert_eq!(
+            verify_span(
+                Some("him"),
+                "Sam Altman",
+                "",
+                "the board reinstated him",
+                &d
+            ),
+            SpanVerdict::Coreference("him".into())
+        );
+        // 单个普通词包在别的名字里也是指代，不改绑（"the company" ≠ "for-profit company"）
+        let d2 = declared(&[
+            "OpenAI",
+            "for-profit company",
+            "Satya Nadella",
+            "Jony Ive",
+            "Apple",
+            "Microsoft",
+            "Helen Toner",
+            "Fidji Simo",
+        ]);
+        assert_eq!(
+            verify_span(
+                Some("the company"),
+                "OpenAI",
+                "",
+                "the company took over",
+                &d2
+            ),
+            SpanVerdict::Coreference("the company".into())
+        );
+        // 片段以另一个名字结尾：不猜它是头（v4/v5 里猜错的多过猜对的），照描述处理
+        assert_eq!(
+            verify_span(
+                Some("Microsoft chief executive Satya Nadella"),
+                "Microsoft",
+                "OpenAI",
+                "convinced Microsoft chief executive Satya Nadella",
+                &d2
+            ),
+            SpanVerdict::Described("Microsoft chief executive Satya Nadella".into())
+        );
+        assert_eq!(
+            verify_span(
+                Some("Swisher and The Verge reporter Alex Heath"),
+                "Kara Swisher",
+                "",
+                "Swisher and The Verge reporter Alex Heath stated",
+                &declared(&["Kara Swisher", "Alex Heath", "The Verge"])
+            ),
+            SpanVerdict::Described("Swisher and The Verge reporter Alex Heath".into())
+        );
+        // 以另一侧的名字结尾：抄错了位置，绑定照旧、只记
+        assert_eq!(
+            verify_span(
+                Some("CEO of Applications: Fidji Simo"),
+                "OpenAI",
+                "Fidji Simo",
+                "CEO of Applications: Fidji Simo",
+                &d2
+            ),
+            SpanVerdict::Misplaced("CEO of Applications: Fidji Simo".into())
+        );
+        // 末尾的名字是介词的补语或名单的最后一项，不是头：不改绑（v4 的四个错例）
+        let d3 = declared(&[
+            "OpenAI",
+            "companies using OpenAI",
+            "TBPN",
+            "California",
+            "Pioneer Building",
+            "San Francisco",
+            "Anthropic",
+        ]);
+        assert_eq!(
+            verify_span(
+                Some("Over one hundred companies using OpenAI"),
+                "companies using OpenAI",
+                "Anthropic",
+                "Over one hundred companies using OpenAI contacted Anthropic",
+                &d3
+            ),
+            SpanVerdict::Prefixed("Over one hundred companies using OpenAI".into())
+        );
+        assert_eq!(
+            verify_span(
+                Some("his vested equity in OpenAI"),
+                "vested equity",
+                "Sam Altman",
+                "forfeited his vested equity in OpenAI",
+                &d3
+            ),
+            SpanVerdict::Described("his vested equity in OpenAI".into())
+        );
+        assert_eq!(
+            verify_span(
+                Some("TBPN, a media company in California"),
+                "TBPN",
+                "OpenAI",
+                "acquired TBPN, a media company in California",
+                &d3
+            ),
+            SpanVerdict::Ok
+        );
+        assert_eq!(
+            verify_span(
+                Some("the Pioneer Building in the Mission District, San Francisco"),
+                "Pioneer Building",
+                "OpenAI",
+                "located in the Pioneer Building in the Mission District, San Francisco",
+                &d3
+            ),
+            SpanVerdict::Described(
+                "the Pioneer Building in the Mission District, San Francisco".into()
+            )
+        );
+        // 名字后面紧跟逗号：同位语，还是它
+        assert_eq!(
+            verify_span(
+                Some("Helen Toner, strategy director for the Center for Security and Emerging Technology"),
+                "Helen Toner",
+                "OpenAI",
+                "and Helen Toner, strategy director for the Center for Security and Emerging Technology",
+                &d2
+            ),
+            SpanVerdict::Ok
+        );
+        // 没给片段：老行为
+        assert_eq!(verify_span(None, "OpenAI", "", quote, &d), SpanVerdict::Ok);
+        // 片段不在引文里：只记不拦
+        assert_eq!(
+            verify_span(Some("OpenAI staff"), "OpenAI", "", q2, &d),
+            SpanVerdict::NotInQuote
+        );
+    }
+
+    /// 模型写的名字和它 ref 指的实体打架：写 "OpenAI employees" 却指向 OpenAI
+    #[test]
+    fn a_written_name_that_describes_its_reference_is_a_description() {
+        use super::written_verdict;
+        let d = declared(&[
+            "OpenAI",
+            "Anthropic",
+            "Sam Altman",
+            "OpenAI's board of directors",
+        ]);
+        // v5 的最后一条假边：片段 "eleven employees" 没有名字拦不住，写的名字拦得住
+        assert_eq!(
+            written_verdict("OpenAI employees", "OpenAI", "Anthropic", true, &d),
+            SpanVerdict::Described("OpenAI employees".into())
+        );
+        assert_eq!(
+            written_verdict("Former OpenAI personnel", "OpenAI", "Anthropic", true, &d),
+            SpanVerdict::Described("Former OpenAI personnel".into())
+        );
+        // 写的是另一个声明过的实体：改绑
+        assert_eq!(
+            written_verdict(
+                "OpenAI's board of directors",
+                "OpenAI",
+                "Sam Altman",
+                true,
+                &d
+            ),
+            SpanVerdict::Rebind("OpenAI's board of directors".into())
+        );
+        // 写的就是那个名字（含后缀、部分）、没有 ref、或是指代：无事
+        assert_eq!(
+            written_verdict("OpenAI, Inc.", "OpenAI", "", true, &d),
+            SpanVerdict::Ok
+        );
+        assert_eq!(
+            written_verdict("Altman", "Sam Altman", "", true, &d),
+            SpanVerdict::Ok
+        );
+        assert_eq!(
+            written_verdict("OpenAI employees", "OpenAI", "", false, &d),
+            SpanVerdict::Ok
+        );
+        assert_eq!(
+            written_verdict("the company", "OpenAI", "", true, &d),
+            SpanVerdict::Ok
+        );
+    }
+
+    /// 名字后面接着 and 再接专名，是并列的一项，不是描述（#595）；接着 and 再接小写
+    /// 的描述还是描述
+    #[test]
+    fn a_name_in_a_coordination_is_one_of_the_list() {
+        let d = declared(&["SB Energy", "SoftBank", "OpenAI"]);
+        let q = "SB Energy and SoftBank will build at least 10 GW of new energy generation";
+        assert_eq!(
+            verify_span(Some("SB Energy and SoftBank"), "SB Energy", "", q, &d),
+            SpanVerdict::Ok
+        );
+        assert_eq!(
+            verify_span(
+                Some("SB Energy & SoftBank"),
+                "SB Energy",
+                "",
+                "SB Energy & SoftBank will build",
+                &d
+            ),
+            SpanVerdict::Ok
+        );
+        // 绑在后一项上：名字前面带词，只记
+        assert_eq!(
+            verify_span(Some("SB Energy and SoftBank"), "SoftBank", "", q, &d),
+            SpanVerdict::Prefixed("SB Energy and SoftBank".into())
+        );
+        assert_eq!(
+            verify_span(
+                Some("OpenAI and its investors"),
+                "OpenAI",
+                "",
+                "OpenAI and its investors agreed",
+                &d
+            ),
+            SpanVerdict::Described("OpenAI and its investors".into())
+        );
+    }
+
+    /// 名字后面接着专名样子的续词是同一个东西；接着小写的词就不是
+    #[test]
+    fn a_name_continued_in_capitals_is_the_same_thing() {
+        let d = declared(&["Anthropic", "OpenAI"]);
+        assert_eq!(
+            verify_span(
+                Some("Anthropic PBC"),
+                "Anthropic",
+                "",
+                "Anthropic PBC filed",
+                &d
+            ),
+            SpanVerdict::Ok
+        );
+        assert_eq!(
+            verify_span(
+                Some("OpenAI Global, LLC"),
+                "OpenAI",
+                "",
+                "OpenAI Global, LLC is the for-profit arm",
+                &d
+            ),
+            SpanVerdict::Ok
+        );
+        assert_eq!(
+            verify_span(
+                Some("OpenAI employees"),
+                "OpenAI",
+                "",
+                "OpenAI employees left",
+                &d
+            ),
+            SpanVerdict::Described("OpenAI employees".into())
+        );
+    }
+
+    #[test]
+    fn a_slot_matches_its_name_by_stem_and_suffix() {
+        assert!(slot_matches("OpenAI", "OpenAI, Inc."));
+        assert!(slot_matches("Acme", "Acme Corp."));
+        assert!(slot_matches("openai", "OpenAI"));
+        assert!(slot_matches("OpenAI's", "OpenAI"));
+        assert!(slot_matches("Altman", "Sam Altman"));
+        assert!(slot_matches("Anthropic", "Anthropic, PBC"));
+        assert!(slot_matches(
+            "the Center for Security and Emerging Technology",
+            "Center for Security and Emerging Technology"
+        ));
+        assert!(!slot_matches("Former OpenAI personnel", "OpenAI"));
+        assert!(!slot_matches("Anthropic", "OpenAI"));
+    }
+
+    #[test]
+    fn a_span_is_found_in_its_quote_regardless_of_case_and_spacing() {
+        assert!(span_in_quote(
+            "former openai   personnel",
+            "Former OpenAI personnel have founded"
+        ));
+        assert!(!span_in_quote(
+            "OpenAI staff",
+            "Former OpenAI personnel have founded"
+        ));
+        assert!(!span_in_quote("", "anything"));
+    }
+
     use super::{
         incomplete_reason, looks_literal, no_ref_name_binding, referenced_entity, resolve_bare,
-        resolve_handle, BoundEntity, NoRefNameBinding,
+        resolve_handle, validity_of, BoundEntity, NoRefNameBinding,
     };
     use std::collections::HashMap;
     use uuid::Uuid;
 
     #[test]
-    fn only_numbers_and_dates_count_as_literals() {
+    fn quantities_and_dates_count_as_literals() {
         // 认：这些出现在宾语位上时是值，不是实体
-        for yes in ["2015", "2023-03", "2024-01-15", "1200", "62.5", "-3"] {
+        for yes in [
+            "2015",
+            "2023-03",
+            "2024-01-15",
+            "1200",
+            "62.5",
+            "-3",
+            // 带符号与量级词的量。从前这一档不认，于是图上长出一个叫
+            // 「$5 billion」的节点，同名的还并成一个，把毫不相干的两家公司连起来
+            "$5 billion",
+            "€1.5 million",
+            "52%",
+            "35,000",
+            // 合同照原文写的日期（#688）
+            "June 23, 2020",
+            "17 Mar. 2020",
+            "2020年3月17日",
+        ] {
             assert!(looks_literal(yes), "{yes} 该认成字面值");
         }
         // 不认：判错的代价是把一个真实体降成一段文本，所以宁可漏
@@ -2161,9 +4063,39 @@ mod tests {
             "",
             "   ",
             "２０１５", // 全角数字：不是我们要处理的形态，交给实体路径
+            // 尾巴上还有实词：它说的不再只是那个数
+            "900 million weekly active users",
+            "2025 Atlantic hurricane season",
+            "$10 billion investment",
+            "8GW data center",
         ] {
             assert!(!looks_literal(no), "{no} 不该认成字面值");
         }
+    }
+
+    /// 区间两端照合同原文写（#688）：读成日期，精度随写了几位；「unknown」仍是结束了不知哪天
+    #[test]
+    fn a_written_start_keeps_the_precision_it_was_written_with() {
+        let day = validity_of(Some("June 8, 2020"), None, None);
+        assert_eq!(
+            day.from.map(|t| t.date_naive().to_string()).as_deref(),
+            Some("2020-06-08")
+        );
+        assert_eq!(day.from_precision, Some("day"));
+        assert!(!day.has_ended());
+
+        let month = validity_of(Some("March 2020"), Some("17 Mar. 2021"), None);
+        assert_eq!(month.from_precision, Some("month"));
+        assert_eq!(
+            month.to.map(|t| t.date_naive().to_string()).as_deref(),
+            Some("2021-03-17")
+        );
+        assert_eq!(month.to_precision, Some("day"));
+
+        // 说不清几月几号的不当起点
+        let ambiguous = validity_of(Some("03/04/2020"), Some("unknown"), None);
+        assert_eq!((ambiguous.from, ambiguous.from_precision), (None, None));
+        assert_eq!(ambiguous.to_precision, Some("unknown"));
     }
 
     #[test]
@@ -2375,7 +4307,9 @@ mod tests {
                 .await?;
             }
             let pairs: Vec<(Uuid, Uuid)> = sqlx::query_as(
-                "SELECT subject_id, object_id FROM facts WHERE kb_id = $1 ORDER BY subject_id",
+                // 只看边：实体身上还有名字事实（0041），那些没有宾语实体
+                "SELECT subject_id, object_id FROM facts
+                  WHERE kb_id = $1 AND object_id IS NOT NULL ORDER BY subject_id",
             )
             .bind(kb)
             .fetch_all(&pool)
@@ -2458,7 +4392,8 @@ mod tests {
                 "later bare mentions must reuse document-local C"
             );
             let c_objects: Vec<Uuid> = sqlx::query_scalar(
-                "SELECT object_id FROM facts WHERE kb_id = $1 AND subject_id = $2 ORDER BY object_id",
+                "SELECT object_id FROM facts
+                  WHERE kb_id = $1 AND subject_id = $2 AND object_id IS NOT NULL ORDER BY object_id",
             )
             .bind(kb)
             .bind(c)
@@ -2620,5 +4555,38 @@ mod tests {
             .execute(&pool)
             .await;
         run
+    }
+}
+
+#[cfg(test)]
+mod undeclared_beside_value_tests {
+    use super::undeclared_beside_value;
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
+    #[test]
+    fn a_phrase_beside_a_value_is_not_an_entity() {
+        let mut declared = HashMap::new();
+        declared.insert("SB Energy".to_string(), Uuid::nil());
+        declared.insert("Microsoft".to_string(), Uuid::nil());
+        // 回复里的真形状：没句柄、没声明 → 值落下，短语进谓词
+        assert!(undeclared_beside_value(
+            None,
+            "new energy generation",
+            &declared
+        ));
+        assert!(undeclared_beside_value(
+            Some(" "),
+            "new regional grid infrastructure",
+            &declared
+        ));
+        // 宾语有句柄，或者是认下的名字（大小写不计）→ 是实体，走边
+        assert!(!undeclared_beside_value(
+            Some("e2"),
+            "new energy generation",
+            &declared
+        ));
+        assert!(!undeclared_beside_value(None, "microsoft", &declared));
+        assert!(!undeclared_beside_value(None, "  ", &declared));
     }
 }
