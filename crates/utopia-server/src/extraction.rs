@@ -1086,7 +1086,7 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
     let await_nod = utopia_store::memory::is_memory_document(&state.pool, document_id).await?;
     let mut pending_count = 0usize;
 
-    let doc_time = doc.doc_time.map(|t| t.format("%Y-%m-%d").to_string());
+    let doc_time = prompt_doc_date(doc.doc_time, &doc.doc_time_source);
     let chunks = utopia_store::documents::chunks_for_extraction(&state.pool, document_id).await?;
     // 文件开头：序号最小的现存分块（不是还没抽的第一块）。备忘文件一个片段一块，
     // 前一段不是后一段的开头，不附
@@ -2961,6 +2961,23 @@ fn undeclared_beside_value(
 ///
 /// "2015"、"2023-03"、"6" 认；"杭州"、"首席技术官"、"3M"、"V3" 不认。
 /// 调用方还额外要求模型**没有**把它声明成实体——两道门一起过才算数。
+/// 给模型看的"这篇写于何时"。
+///
+/// 上传时刻不是文档的日期：`documents.create` 给没日期的上传写下 `doc_time = now()`，
+/// 来源记作 `upload_time`。拿它当文档日期，"去年"就被算到上传那天（#714）。
+/// 没有就是没有——`build_messages` 收到 None 会说日期未知。
+///
+/// 记录轴的锚点不走这里：那是 0045 的事，本函数只管提示词。
+fn prompt_doc_date(
+    doc_time: Option<chrono::DateTime<chrono::Utc>>,
+    doc_time_source: &str,
+) -> Option<String> {
+    if doc_time_source == "upload_time" {
+        return None;
+    }
+    doc_time.map(|t| t.format("%Y-%m-%d").to_string())
+}
+
 /// 模型给的区间两端 → 落库的有效区间。
 ///
 /// **两端各记各的粒度**（见 `facts.valid_to_precision`）。从前一个精度列描述两个端点，
@@ -3646,6 +3663,26 @@ mod name_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// #714：没日期的上传，提示词里就没有日期——否则"去年"会算到上传那天
+    #[test]
+    fn an_undated_upload_gives_the_prompt_no_date() {
+        let uploaded_at = "2026-09-16T10:00:00Z".parse().unwrap();
+        assert_eq!(super::prompt_doc_date(Some(uploaded_at), "upload_time"), None);
+    }
+
+    #[test]
+    fn a_dated_document_still_carries_its_date_into_the_prompt() {
+        let dated = "2024-02-20T08:30:00Z".parse().unwrap();
+        for source in ["content", "source"] {
+            assert_eq!(
+                super::prompt_doc_date(Some(dated), source),
+                Some("2024-02-20".to_string()),
+                "{source}"
+            );
+        }
+        assert_eq!(super::prompt_doc_date(None, "content"), None, "本来就没有");
+    }
 
     #[test]
     fn two_ranked_lists_take_turns_and_the_longer_one_finishes() {
